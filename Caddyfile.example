@@ -1,0 +1,14 @@
+superquant-2026.duckdns.org {
+    encode gzip
+    @health path /health /
+    handle @health {
+        reverse_proxy 127.0.0.1:8000
+    }
+    @callback path /CALLBACK_PATH
+    handle @callback {
+        request_body { max_size 16KB }
+        rewrite * /analyze
+        reverse_proxy 127.0.0.1:8000
+    }
+    respond 404
+}

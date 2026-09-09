@@ -1,0 +1,20 @@
+[Unit]
+Description=Super Agent Daily Scheduler
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=superagent
+Group=superagent
+WorkingDirectory=/opt/super-agent/current
+EnvironmentFile=-/etc/super-agent/super-agent.env
+Environment=TZ=Asia/Shanghai
+ExecStart=/opt/super-agent/current/.venv/bin/python -u /opt/super-agent/current/scheduler.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/super-agent/data /opt/super-agent/logs /opt/super-agent/reports
+[Install]
+WantedBy=multi-user.target

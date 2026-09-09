@@ -1,0 +1,106 @@
+# 本地配置(由迁移工具生成; 路径全部相对项目根目录)
+paths:
+  base_dir: "."
+  data_dir: "data"
+  stock_data_dir: "data/stocks"
+  raw_data_dir: "data/raw"
+  index_data_dir: "data/index"
+  cache_dir: "data/cache"
+  output_dir: "reports"
+  hs300_codes_file: "scripts/hs300_codes.txt"
+  main_board_codes_file: "data/all_main_board_codes.txt"
+  log_file: "logs/system.log"
+  skill_path_dp: "scripts/local_kline_skill.py"
+  state_file: "data/market_state_timeline.json"
+  params_file: "data/optimal_params.json"
+  params_history: "data/params_history.json"
+  deviation_log: "data/deviation_log.json"
+  signal_log: "data/signal_history.json"
+  opt_log_dir: "logs/opt"
+
+# 数据源: coze = 走本地 skill 取数通道(local_kline_skill.py 伪装扣子skill, 实际拉腾讯)
+data_source: "coze"
+plot_enable: true
+
+wechat_push:
+  enable: true
+  sckey: ""
+
+# ============ 策略基准(v6, 运行时被 optimal_params.json 自适应覆盖) ============
+strategy:
+  dc_period: 20
+  exit_period: 10
+  atr_period: 20
+  vol_window: 60
+  chan_lookback: 1
+  base_risk_pct: 0.10
+  min_atr_pct: 0.020
+  base_atr_multiplier: 2.0
+  base_chan_threshold: 0.70
+  min_entry_score: 1.7
+  max_entry_score: 3.5
+  pre_filter_threshold: 60
+  market_hard_cutoff: -0.03
+  volatility_adaptive: true
+  volatility_stop_multiplier_min: 1.5
+  volatility_stop_multiplier_max: 3.0
+  volatility_position_scale_factor: 0.15
+  stock_trend_filter: true
+  stock_trend_lookback: 20
+  min_position_scale: 0.0
+  max_position_scale: 1.00
+  tanh_sensitivity: 4.0
+  vol_ratio_high: 1.3
+  vol_ratio_low: 0.7
+  trend_str_high: 0.15
+  trend_str_low: -0.05
+  use_trend_filter: true
+  use_money_filter: true
+  use_test_pullback: true
+  test_pullback_threshold: 0.02
+  test_pullback_vol_ratio: 0.7
+  test_period: 30
+  test_gain_threshold: 0.06
+  extreme_value_exemption: true
+  pe_historical_percentile_threshold: 0.10
+  pb_historical_percentile_threshold: 0.10
+  extreme_value_position_scale: 0.3
+  extreme_value_max_hold_days: 20
+  vol_stack_threshold_large: 3.0
+  vol_stack_threshold_mid: 5.0
+  vol_stack_threshold_small: 8.0
+  initial_capital: 1000000
+  max_concurrent_positions: 5
+  take_profit_base: 0.40
+  stop_multiplier_base: 2.0
+  add_threshold_base: 0.06
+  trail_stop_pct: 0.05
+  risk_value_ban: 80
+  score_threshold: 2.0
+  max_add_count: 2
+  add_interval_atr: 1.0
+  mc_est: 150
+  use_money_filter: true
+
+# ============ 交易成本(回测与v6影子盘共用; 主模拟盘保留历史原价口径) ============
+trade_cost:
+  commission_rate: 0.0003
+  min_commission: 5.0
+  stamp_tax: 0.001
+  market_cap_split: 100
+  slip_small: 0.001
+  slip_big: 0.002
+
+# ============ 过滤段(当前主策略未直接使用, 保留空壳) ============
+filter: {}
+
+# ============ 风控 ============
+risk:
+  single_max_pos: 0.25
+  industry_max_pct: 0.40
+  circuit_dd_halve: 0.15
+  circuit_dd_stop: 0.25
+
+# ============ 大盘趋势择时(主回测默认关闭, 由状态机接管) ============
+market_trend:
+  enable: false

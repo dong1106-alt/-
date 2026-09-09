@@ -1,0 +1,35 @@
+# Python runtime
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local agent workspace
+.zcode/
+
+# Runtime state and market data; retain Python source under data/
+data/**
+!data/**/
+!data/**/*.py
+logs/
+reports/
+codeact/output/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.bak
+*.bak_*
+
+# Secrets and local config
+config/secrets.yaml
+*.env
+.env
+.env.*
+!.env.example
+
+# Release artifacts
+release/
+dist/
+*.zip
+*.tar.gz
