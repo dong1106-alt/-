@@ -1435,7 +1435,11 @@ def scan_single_stock_phase1(code: str, market_pos_scale: float, market_slope: f
             elif chan_ok:
                 buy_type = "缠论买点"
             elif breakout:
-                buy_type = "纯突破"
+                # 【优化·稳健】裸突破过滤：纯突破需再满足趋势/资金/量能至少一项确认，否则跳过
+                if trend_ok or money_ok or vol_ok:
+                    buy_type = "纯突破"
+                else:
+                    buy_signal = False
             else:
                 buy_type = "综合评分"
 

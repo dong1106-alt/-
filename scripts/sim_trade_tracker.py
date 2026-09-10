@@ -104,8 +104,11 @@ def _fetch_kline_via_cli(code, count=60):
 
 # 单票仓位上限（占总市值比例）
 SINGLE_STOCK_MAX_PCT = float(os.environ.get("SIM_SINGLE_STOCK_MAX_PCT", "45.0"))
-# 影子组合的候选风控：0 表示关闭，保持主模拟盘历史行为不变。
-MAX_STOP_PCT = float(os.environ.get("SIM_MAX_STOP_PCT", "0"))
+# 止损距离上限（小数，0.10=-10%以内必须止损）；影子组合经 env 覆盖为 0.12。
+# 2026-09-11 起主模拟盘启用，收紧“宽止损导致单笔亏损过大”。
+MAX_STOP_PCT = float(os.environ.get("SIM_MAX_STOP_PCT", "0.10"))
+# 单笔风险敞口上限（小数）：买入金额 × 止损距离 ≤ 总资产 × 该比例（0.01=单笔最多亏总资产1%）
+MAX_RISK_PER_TRADE_PCT = float(os.environ.get("SIM_MAX_RISK_PER_TRADE_PCT", "0.01"))
 SHADOW_MODE = os.environ.get("SIM_SHADOW_MODE", "0") == "1"
 MAX_HOLD_DAYS = int(os.environ.get("SIM_MAX_HOLD_DAYS", "0"))
 TRADE_COST_CFG = load_trade_cost(os.path.join(BASE_DIR, "config", "settings.yaml"))
@@ -782,6 +785,20 @@ def allocate_buy_budget(total_value, current_position_value, cash,
 
         if not changed:
             break
+
+    # 【优化·稳健】单笔风险敞口上限：买入金额 × 止损距离 ≤ 总资产 × MAX_RISK_PER_TRADE_PCT
+    signal_by_code = {b.get("code"): b for b in selected_signals}
+    for code in list(allocations.keys()):
+        b = signal_by_code.get(code) or {}
+        raw_stop_pct = float(b.get("stop_pct") or 0) / 100.0  # 信号端为百分数，转小数
+        if raw_stop_pct <= 0:
+            raw_stop_pct = MAX_STOP_PCT if MAX_STOP_PCT > 0 else 0.10
+        eff_stop = min(raw_stop_pct, MAX_STOP_PCT) if MAX_STOP_PCT > 0 else raw_stop_pct
+        if eff_stop <= 0:
+            continue
+        max_risk_value = total_value * MAX_RISK_PER_TRADE_PCT / eff_stop
+        if allocations[code] > max_risk_value:
+            allocations[code] = max_risk_value
 
     # 确保不超过可用现金总额
     total_allocated = sum(allocations.values())
