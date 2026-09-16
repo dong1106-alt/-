@@ -8,13 +8,13 @@ $pyw = Join-Path $root '.venv\Scripts\pythonw.exe'
 if (-not (Test-Path -LiteralPath $pyw)) { throw "pythonw not found: $pyw" }
 
 $defs = @(
-  @{ Name='超级智能体-信号扫描'; Args="-u run_once.py daily_signal_scan scripts/daily_signal_scan.py 3600";  Time='15:00'; Kind='weekday' },
-  @{ Name='超级智能体-模拟交易'; Args="-u run_once.py sim_trade_tracker scripts/sim_trade_tracker.py 1800"; Time='15:20'; Kind='weekday' },
-  @{ Name='超级智能体-巡检';     Args="-u run_once.py daily_pipeline_codeact scripts/daily_pipeline_codeact.py 1200"; Time='15:30'; Kind='weekday' },
-  @{ Name='超级智能体-每日优化'; Args="-u run_once.py daily_optimize scripts/daily_optimize.py 1800"; Time='16:30'; Kind='weekday' },
-  @{ Name='超级智能体-微信日报'; Args="-u run_once.py wechat_daily_summary scripts/daily_wechat_summary.py 300"; Time='17:45'; Kind='weekday' },
-  @{ Name='超级智能体-月度优化'; Args="-u run_once.py --only-day 1 monthly_reoptimize scripts/monthly_reoptimize.py 3600"; Time='15:35'; Kind='weekday' },
-  @{ Name='超级智能体-开机补跑'; Args='-u run_once.py --catchup'; Time=$null; Kind='logon' }
+  @{ Name='超级智能体-信号扫描'; Args="-u scripts/run_once.py daily_signal_scan scripts/daily_signal_scan.py 3600";  Time='15:00'; Kind='weekday' },
+  @{ Name='超级智能体-模拟交易'; Args="-u scripts/run_once.py sim_trade_tracker scripts/sim_trade_tracker.py 1800"; Time='15:20'; Kind='weekday' },
+  @{ Name='超级智能体-巡检';     Args="-u scripts/run_once.py daily_pipeline_codeact scripts/daily_pipeline_codeact.py 1200"; Time='15:30'; Kind='weekday' },
+  @{ Name='超级智能体-每日优化'; Args="-u scripts/run_once.py daily_optimize scripts/daily_optimize.py 1800"; Time='16:30'; Kind='weekday' },
+  @{ Name='超级智能体-微信日报'; Args="-u scripts/run_once.py wechat_daily_summary scripts/daily_wechat_summary.py 300"; Time='17:45'; Kind='weekday' },
+  @{ Name='超级智能体-月度优化'; Args="-u scripts/run_once.py --only-day 1 monthly_reoptimize scripts/monthly_reoptimize.py 3600"; Time='15:35'; Kind='weekday' },
+  @{ Name='超级智能体-开机补跑'; Args='-u scripts/run_once.py --catchup'; Time=$null; Kind='logon' }
 )
 
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
