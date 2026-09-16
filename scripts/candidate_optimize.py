@@ -55,7 +55,8 @@ def _candidate_identity(output: dict) -> tuple[str, str]:
     for path in (
         ROOT / "龟缠量化v6_optimized.py",
         *(ROOT / "scripts" / name for name in (
-            "causal_backtest.py", "candidate_engine.py", "point_in_time_universe.py",
+            "causal_backtest.py", "candidate_engine.py", "candidate_optimize.py",
+            "backfill_history.py", "point_in_time_universe.py",
             "daily_signal_scan.py", "sim_trade_tracker.py", "trading_rules.py",
             "shadow_pipeline.py", "shadow_evaluate.py",
         )),
@@ -67,11 +68,10 @@ def _candidate_identity(output: dict) -> tuple[str, str]:
         "code": code_hash.hexdigest(), "params": params,
         "data": output.get("data_snapshot_hash"),
         "universe": (output.get("point_in_time_universe") or {}).get("sha256"),
+        "history": (output.get("point_in_time_universe") or {}).get("stock_history_manifest_sha256"),
     })
-    periods = {
-        r.get("state"): [(f.get("val_start"), f.get("val_end")) for f in r.get("fold_metrics", [])]
-        for r in output.get("results", [])
-    }
+    periods = sorted({(f.get("val_start"), f.get("val_end"))
+                      for r in output.get("results", []) for f in r.get("fold_metrics", [])})
     validation_key = _hash_payload({
         "protocol": output.get("validation_protocol"), "periods": periods,
     })

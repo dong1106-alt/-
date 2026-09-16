@@ -64,6 +64,10 @@ with tempfile.TemporaryDirectory(prefix="candidate_safety_") as tmp:
     changed["results"][0]["params"] = {"marker": 2}
     rejected, reused = runner._ledger_decision(changed)
     assert reused and rejected["decision"] == "rejected"
+    partial = json.loads(json.dumps(changed))
+    partial["results"] = partial["results"][:2]
+    rejected, reused = runner._ledger_decision(partial)
+    assert reused and rejected["decision"] == "rejected"
 after = hashlib.sha256(main_params.read_bytes()).hexdigest() if main_params.exists() else None
 assert before == after
 print("candidate_optimizer_main_params_unchanged_ok")

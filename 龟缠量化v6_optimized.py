@@ -3285,7 +3285,7 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
             'baseline_drawdown': baseline['max_drawdown'],
             'baseline_trades': baseline['trades'],
             'baseline_win_rate': baseline.get('win_rate', 0),
-            'excess_sharpe_positive': val['sharpe'] > baseline['sharpe'],
+            'excess_sharpe_positive': bool(val['sharpe'] > baseline['sharpe']),
         })
 
     elapsed = time.time() - start_time
@@ -3359,7 +3359,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
     print("=" * 60)
 
     # 加载股票代码
-    from scripts.point_in_time_universe import load_universe
+    from scripts.point_in_time_universe import load_history_manifest, load_universe
     universe_by_date, universe_meta = load_universe()
     if stock_codes is None:
         all_codes = get_all_local_codes()
@@ -3425,32 +3425,21 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
         and universe_meta.get('start', '9999-99-99') <= evaluation_start
         and universe_meta.get('end', '') >= evaluation_end
     )
-    stock_data_coverage = 0.0
-    if universe_date_complete:
-        expected_bars = {}
-        for day, codes in universe_by_date.items():
-            if not (evaluation_start <= day <= evaluation_end):
-                continue
-            for code in codes:
-                expected_bars.setdefault(code, set()).add(day)
-        covered = 0
-        for code, expected_days in expected_bars.items():
-            frame = load_stock_data(code)
-            if frame is None or frame.empty:
-                continue
-            actual_days = set(pd.to_datetime(frame['date']).dt.strftime('%Y-%m-%d'))
-            if expected_days <= actual_days:
-                covered += 1
-        stock_data_coverage = covered / len(expected_bars) if expected_bars else 0.0
-        universe_meta.update({
-            'historical_stock_count': len(expected_bars),
-            'covered_stock_count': covered,
-            'stock_data_coverage': round(stock_data_coverage, 6),
-        })
-    if not universe_date_complete or stock_data_coverage < 1.0:
+    history_meta = load_history_manifest(
+        evaluation_start, evaluation_end, universe_meta.get('sha256', ''),
+        verify_files=universe_date_complete, universe_by_date=universe_by_date,
+    )
+    stock_data_coverage = float(history_meta.get('coverage', 0.0) or 0.0)
+    universe_meta.update({
+        'historical_stock_count': int(history_meta.get('expected_codes', 0) or 0),
+        'covered_stock_count': int(history_meta.get('complete_codes', 0) or 0),
+        'stock_data_coverage': stock_data_coverage,
+        'stock_history_manifest_sha256': history_meta.get('manifest_sha256'),
+    })
+    if not universe_date_complete or not history_meta.get('complete'):
         universe_meta = {
             **universe_meta, 'complete': False,
-            'reason': 'historical universe or stock bars do not fully cover optimization data',
+            'reason': history_meta.get('reason', 'historical universe or stock bars incomplete'),
         }
         print("⚠️ 历史时点股票池不完整：结果仅供研究，禁止候选晋级")
 
@@ -3475,6 +3464,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
 
     # 按状态分别优化（states允许调用方只优化子集，如每日轮换只跑2个状态）
     all_states = ['bull', 'bear', 'sideways', 'transition']
+    fail_fast = states is None and not test_mode
     if states:
         states = [s for s in states if s in all_states] or all_states
         if len(states) < len(all_states):
@@ -3500,6 +3490,9 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             pass
 
     for state in states:
+        if fail_fast and any(r.get('status') == 'rejected' for r in results):
+            print('已有状态未通过滚动验证，候选提前拒绝')
+            break
         if state in completed_states:
             print(f"\n{state} 已完成，跳过")
             continue
@@ -3533,8 +3526,10 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             'point_in_time_universe': universe_meta,
         }
         Path(partial_file).parent.mkdir(parents=True, exist_ok=True)
-        with open(partial_file, 'w', encoding='utf-8') as f:
+        partial_temp = f"{partial_file}.tmp"
+        with open(partial_temp, 'w', encoding='utf-8') as f:
             json.dump(partial_output, f, ensure_ascii=False, indent=2)
+        os.replace(partial_temp, partial_file)
         print(f"  → 已保存断点（{state}完成）")
 
     # 保存结果
@@ -3552,8 +3547,10 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
 
     final_output_path = output_path or PARAMS_FILE
     os.makedirs(os.path.dirname(final_output_path) or '.', exist_ok=True)
-    with open(final_output_path, 'w', encoding='utf-8') as f:
+    final_temp = f"{final_output_path}.tmp"
+    with open(final_temp, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
+    os.replace(final_temp, final_output_path)
     
     # 清理断点文件（keep_partial=True时保留给调用方跨天累积，凑齐全状态后由调用方清理）
     if os.path.exists(partial_file):

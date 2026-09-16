@@ -5,7 +5,9 @@ import json
 import tempfile
 from pathlib import Path
 
-from point_in_time_universe import load_universe, universe_from_listings
+import pandas as pd
+
+from point_in_time_universe import load_history_manifest, load_universe, universe_from_listings
 
 
 rebuilt = universe_from_listings([
@@ -53,3 +55,29 @@ with tempfile.TemporaryDirectory() as tmp:
     assert not load_universe(snapshot, metadata)[1]["complete"]
 
 print("point_in_time_universe_ok")
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    stocks = base / "stocks"
+    stocks.mkdir()
+    stock = stocks / "sh600001.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2024-01-02"]), "open": [10.0],
+                  "high": [11.0], "low": [9.0], "close": [10.5], "volume": [100]}).to_parquet(stock)
+    digest = hashlib.sha256(stock.read_bytes()).hexdigest()
+    manifest = base / "manifest.json"
+    payload = {
+        "complete": True, "coverage": 1.0, "start": "2023-01-01", "end": "2024-12-31",
+        "universe_sha256": "universe", "expected_codes": 1, "complete_codes": 1,
+        "stocks": {"sh600001": {"status": "complete", "sha256": digest,
+                                "queried_windows": [["2023-01-01", "2024-12-31"]]}},
+    }
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    assert load_history_manifest("2024-01-01", "2024-12-01", "universe", manifest, stocks)["complete"]
+    assert not load_history_manifest("2024-01-01", "2024-12-01", "universe", manifest, stocks,
+                                     universe_by_date={"2024-01-02": {"sh600001", "sz000001"}})["complete"]
+    assert not load_history_manifest("2022-01-01", "2024-12-01", "universe", manifest, stocks)["complete"]
+    assert not load_history_manifest("2024-01-01", "2024-12-01", "changed", manifest, stocks)["complete"]
+    stock.write_bytes(stock.read_bytes() + b"tampered")
+    assert not load_history_manifest("2024-01-01", "2024-12-01", "universe", manifest, stocks)["complete"]
+
+print("stock_history_manifest_ok")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Each validation fold must use parameters fitted only on its own past."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -63,6 +64,7 @@ folds = result["fold_metrics"]
 assert len(folds) >= 3
 assert result["params"] == folds[-1]["params"]
 assert len({row["params"]["vol_ratio_high"] for row in folds}) == len(folds)
+json.dumps(result)
 for index, row in enumerate(folds):
     train, validation, baseline = events[index * 3:index * 3 + 3]
     assert train[1] < validation[0]

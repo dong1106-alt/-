@@ -7,7 +7,7 @@ import gzip
 import hashlib
 import json
 import socket
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +15,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SNAPSHOT = ROOT / "data" / "universe" / "point_in_time.json.gz"
 DEFAULT_METADATA = ROOT / "data" / "universe" / "metadata.json"
+DEFAULT_HISTORY_MANIFEST = ROOT / "data" / "universe" / "stock_history_manifest.json"
+DEFAULT_STOCK_DIR = ROOT / "data" / "stocks"
 
 
 def _main_board(code: str) -> bool:
@@ -71,6 +73,53 @@ def load_universe(snapshot_path=DEFAULT_SNAPSHOT, metadata_path=DEFAULT_METADATA
         and all(universe.values())
     )
     return universe, metadata
+
+
+def load_history_manifest(required_start: str, required_end: str, universe_sha256: str,
+                          manifest_path=DEFAULT_HISTORY_MANIFEST,
+                          stock_dir=DEFAULT_STOCK_DIR, verify_files: bool = True,
+                          universe_by_date: dict | None = None) -> dict:
+    manifest_path = Path(manifest_path)
+    stock_dir = Path(stock_dir)
+    if not manifest_path.exists():
+        return {"complete": False, "reason": "stock history manifest missing"}
+    raw = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return {"complete": False, "reason": "stock history manifest invalid"}
+    result = {**manifest, "manifest_sha256": hashlib.sha256(raw).hexdigest()}
+    stocks = manifest.get("stocks") or {}
+    complete = bool(
+        manifest.get("complete") and manifest.get("coverage") == 1.0 and stocks
+        and manifest.get("universe_sha256") == universe_sha256
+        and manifest.get("start", "9999-99-99") <= required_start
+        and manifest.get("end", "") >= required_end
+        and manifest.get("expected_codes") == manifest.get("complete_codes") == len(stocks)
+        and (universe_by_date is None or set(stocks) == set().union(*universe_by_date.values()))
+    )
+    if complete and verify_files:
+        for code, row in stocks.items():
+            path = stock_dir / f"{code}.parquet"
+            windows = row.get("queried_windows") or []
+            covered = bool(windows and windows[0][0] <= required_start
+                           and windows[-1][1] >= required_end)
+            for previous, current in zip(windows, windows[1:]):
+                if date.fromisoformat(previous[1]) + timedelta(days=1) != date.fromisoformat(current[0]):
+                    covered = False
+                    break
+            if row.get("status") != "complete" or not path.exists() or not covered:
+                complete = False
+                result["reason"] = f"stock history missing: {code}"
+                break
+            if hashlib.sha256(path.read_bytes()).hexdigest() != row.get("sha256"):
+                complete = False
+                result["reason"] = f"stock history checksum mismatch: {code}"
+                break
+    result["complete"] = complete
+    if not complete and "reason" not in result:
+        result["reason"] = "stock history coverage or range incomplete"
+    return result
 
 
 def _save_snapshot(snapshot_path: Path, metadata_path: Path, payload: dict,

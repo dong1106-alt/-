@@ -10,7 +10,7 @@ from pathlib import Path
 
 from candidate_engine import MAX_DRAWDOWN_PCT, write_json
 from candidate_optimize import _candidate_identity
-from point_in_time_universe import load_universe
+from point_in_time_universe import load_history_manifest, load_universe
 
 ROOT = Path(__file__).resolve().parent.parent
 CANDIDATES = ROOT / "data" / "candidates"
@@ -109,6 +109,11 @@ def main(argv=None) -> int:
         raise SystemExit("sealed evaluation has fewer than 3 stocks")
     timeline = core.load_market_states()
     start, end = periods[0]["start"], periods[0]["end"]
+    history_meta = load_history_manifest(start, end, universe_meta["sha256"],
+                                         universe_by_date=universe)
+    if (not history_meta.get("complete")
+            or history_meta.get("manifest_sha256") != candidate_universe.get("stock_history_manifest_sha256")):
+        raise SystemExit("candidate stock history manifest changed or is incomplete")
     candidate_results = []
     baseline_results = []
     for state in REQUIRED_STATES:

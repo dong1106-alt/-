@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from candidate_optimize import _candidate_identity
-from point_in_time_universe import load_universe
+from point_in_time_universe import load_history_manifest, load_universe
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "release"
@@ -48,10 +48,18 @@ def main() -> int:
     active_signature = active.get("candidate_meta", {}).get("evaluation", {}).get("candidate_signature")
     if not active_signature or _candidate_identity(active)[0] != active_signature:
         raise SystemExit("candidate code or parameters changed; release blocked")
-    _, universe_meta = load_universe()
+    universe, universe_meta = load_universe()
     if (not universe_meta.get("complete") or
             (active.get("point_in_time_universe") or {}).get("sha256") != universe_meta.get("sha256")):
         raise SystemExit("historical universe changed or incomplete; release blocked")
+    active_universe = active.get("point_in_time_universe") or {}
+    history_meta = load_history_manifest(
+        universe_meta.get("start", ""), universe_meta.get("end", ""), universe_meta.get("sha256", ""),
+        universe_by_date=universe,
+    )
+    if (not history_meta.get("complete")
+            or active_universe.get("stock_history_manifest_sha256") != history_meta.get("manifest_sha256")):
+        raise SystemExit("stock history manifest changed or incomplete; release blocked")
     approval_path = ROOT / "data" / "candidates" / f"release_gate_{active_signature[:12]}.json"
     if not approval_path.exists():
         raise SystemExit("sealed release approval missing; release blocked")
