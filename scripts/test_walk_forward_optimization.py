@@ -71,4 +71,32 @@ for index, row in enumerate(folds):
     assert validation[0] == baseline[0]
     assert train[2] == validation[2] == row["params"]["vol_ratio_high"]
 
+calendar_folds, _ = core.build_walk_forward_folds(dates)
+assert len(calendar_folds) == 4
+events.clear()
+study_number = 0
+sparse_days = dates[:252] + [calendar_folds[i].validation_start for i in (0, 2, 3)]
+sparse = core.optimize_for_state(
+    "bull", ["sh600000"], {}, sparse_days, n_trials=1, calendar_dates=dates,
+)
+assert len(sparse["fold_metrics"]) == 4
+assert [f["eligible"] for f in sparse["fold_metrics"]] == [True, False, True, True]
+assert sparse["eligible_fold_count"] == 3
+assert sparse["val_trades"] == 36
+assert len(events) == 9  # No optimization or backtest for the empty-state fold.
+
+too_sparse = core.optimize_for_state(
+    "bull", ["sh600000"], {}, dates[:252] + [calendar_folds[i].validation_start for i in (0, 2)],
+    n_trials=1, calendar_dates=dates,
+)
+assert too_sparse["eligible_fold_count"] == 2
+assert too_sparse["status"] == "rejected"
+
+no_fresh = core.optimize_for_state(
+    "bull", ["sh600000"], {}, dates, n_trials=1, calendar_dates=dates,
+    validation_after=str(calendar_folds[-1].validation_end)[:10],
+)
+assert no_fresh["status"] == "research_only"
+assert no_fresh["fold_metrics"] == []
+
 print("walk_forward_optimization_ok")

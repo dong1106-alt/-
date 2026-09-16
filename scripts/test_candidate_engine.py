@@ -11,15 +11,15 @@ def row(state, trades=20, sharpe=1.2, baseline=1.0, ret=5.0, base_ret=4.0, dd=-5
         "val_drawdown": dd, "baseline_val_drawdown": base_dd,
         "val_win_rate": 55, "baseline_val_win_rate": 50,
         "fold_metrics": [
-            {"excess_sharpe_positive": True},
-            {"excess_sharpe_positive": True},
-            {"excess_sharpe_positive": True},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20},
         ],
     }
 
 
 good = {
-    "validation_protocol": "wf-v2",
+    "validation_protocol": "wf-v3",
     "point_in_time_universe": {"complete": True},
     "results": [row("bull"), row("bear"), row("sideways")],
 }
@@ -36,5 +36,20 @@ assert evaluate_backtest(bad_sharpe)["decision"] == "rejected"
 
 missing_universe = {**good, "point_in_time_universe": {"complete": False}}
 assert evaluate_backtest(missing_universe)["decision"] == "rejected"
+
+old_protocol = {**good, "validation_protocol": "wf-v2"}
+assert evaluate_backtest(old_protocol)["decision"] == "rejected"
+
+sparse_bear = row("bear")
+sparse_bear["fold_metrics"] = sparse_bear["fold_metrics"][:2] + [
+    {"eligible": False, "validation_state_days": 0, "excess_sharpe_positive": False},
+]
+sparse = {**good, "results": [row("bull"), sparse_bear, row("sideways")]}
+assert evaluate_backtest(sparse)["decision"] == "rejected"
+assert "有效滚动验证少于3折" in evaluate_backtest(sparse)["reason"]
+
+missing_state = {**good, "results": [row("bull"), row("bear")],
+                 "skipped_states": [{"state": "sideways", "reason": "前置状态未通过，提前停止"}]}
+assert "sideways（前置状态未通过，提前停止）" in evaluate_backtest(missing_state)["reason"]
 
 print("candidate_engine_smoke_ok")

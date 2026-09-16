@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from candidate_engine import evaluate_backtest, write_json
+from candidate_engine import MIN_WALK_FORWARD_FOLDS, evaluate_backtest, write_json
+from causal_backtest import STRICT_EVALUATION_START, build_walk_forward_folds
 
 CANDIDATES = ROOT / "data" / "candidates"
 
@@ -50,6 +51,43 @@ def _hash_payload(payload) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _validation_periods(output: dict) -> list[tuple[str, str]]:
+    return sorted({(f.get("val_start"), f.get("val_end"))
+                   for r in output.get("results", []) for f in r.get("fold_metrics", [])})
+
+
+def _consumed_periods() -> list[tuple[str, str]] | None:
+    ledger_path = CANDIDATES / "validation_ledger.json"
+    if not ledger_path.exists():
+        return []
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    periods = []
+    for key, entry in ledger.get("entries", {}).items():
+        historical = entry.get("validation_periods")
+        if not historical:
+            # Pre-v3 ledgers recorded only the hash. Recover dates from their raw candidate.
+            for path in (CANDIDATES / "raw").glob("*.json"):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    historical = _validation_periods(raw)
+                except (OSError, ValueError):
+                    continue
+                if _hash_payload({"protocol": "wf-v2", "periods": historical}) == key:
+                    break
+            else:
+                return None
+        periods.extend(tuple(period) for period in historical)
+    return periods
+
+
+def _overlaps_consumed(periods: list[tuple[str, str]], consumed: list[tuple[str, str]]) -> bool:
+    return any(start <= old_end and old_start <= end
+               for start, end in periods for old_start, old_end in consumed)
+
+
 def _candidate_identity(output: dict) -> tuple[str, str]:
     code_hash = hashlib.sha256()
     for path in (
@@ -70,11 +108,9 @@ def _candidate_identity(output: dict) -> tuple[str, str]:
         "universe": (output.get("point_in_time_universe") or {}).get("sha256"),
         "history": (output.get("point_in_time_universe") or {}).get("stock_history_manifest_sha256"),
     })
-    periods = sorted({(f.get("val_start"), f.get("val_end"))
-                      for r in output.get("results", []) for f in r.get("fold_metrics", [])})
-    validation_key = _hash_payload({
-        "protocol": output.get("validation_protocol"), "periods": periods,
-    })
+    periods = _validation_periods(output)
+    # Keep the v2 ledger namespace: changing scoring rules must not unlock old periods.
+    validation_key = _hash_payload({"protocol": "wf-v2", "periods": periods})
     return signature, validation_key
 
 
@@ -95,11 +131,21 @@ def _ledger_decision(output: dict) -> tuple[dict, bool]:
             "candidate_signature": signature,
             "validation_key": validation_key,
         }, True
+    consumed = _consumed_periods()
+    if consumed is None or _overlaps_consumed(_validation_periods(output), consumed):
+        return {
+            "decision": "rejected",
+            "reason": ("验证账本缺少历史区间，禁止继续" if consumed is None
+                       else "滚动验证区间与已消费区间重叠，禁止重复试探"),
+            "candidate_signature": signature,
+            "validation_key": validation_key,
+        }, True
     evaluation = evaluate_backtest(output)
     evaluation.update({"candidate_signature": signature, "validation_key": validation_key})
     ledger["entries"][validation_key] = {
         "candidate_signature": signature,
         "evaluation": evaluation,
+        "validation_periods": _validation_periods(output),
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
     write_json(ledger_path, ledger)
@@ -122,6 +168,43 @@ def main(argv: list[str]) -> int:
     raw_path = CANDIDATES / "raw" / f"{candidate_id}.json"
     eval_path = CANDIDATES / "evaluations" / f"{candidate_id}.json"
     n_trials, n_stocks = (50, 50) if monthly else (10, 20)
+    validation_after = None
+
+    if monthly:
+        consumed = _consumed_periods()
+        reason = None
+        if consumed is None:
+            reason = "验证账本缺少历史区间，禁止继续"
+        elif consumed:
+            validation_after = max(end for _, end in consumed)
+            core = _load_core()
+            timeline = core.load_market_states()
+            calendar = [r["date"] for r in timeline if r["date"] >= STRICT_EVALUATION_START]
+            try:
+                folds, _ = build_walk_forward_folds(calendar)
+            except ValueError:
+                folds = []
+            fresh = [fold for fold in folds
+                     if str(fold.validation_start)[:10] > validation_after]
+            if len(fresh) < MIN_WALK_FORWARD_FOLDS:
+                reason = f"新验证折不足{MIN_WALK_FORWARD_FOLDS}折，等待独立数据"
+            else:
+                for state in REQUIRED_STATES:
+                    count = sum(any(r["state"] == state and
+                                    str(fold.validation_start)[:10] <= r["date"] <= str(fold.validation_end)[:10]
+                                    for r in timeline) for fold in fresh)
+                    if count < MIN_WALK_FORWARD_FOLDS:
+                        reason = f"{state}有效新折不足{MIN_WALK_FORWARD_FOLDS}折，等待独立数据"
+                        break
+        if reason:
+            if eval_path.exists():
+                print(f"[candidate] 已有本月评估记录，保留原结果；{reason}")
+                return 0
+            evaluation = {"candidate_id": candidate_id, "decision": "waiting_for_new_data",
+                          "reason": reason}
+            write_json(eval_path, evaluation)
+            print(f"[candidate] {reason}")
+            return 0
 
     if monthly:
         # 断点按月命名：单日超时被杀后，顺延日重跑能从已完成状态续起；跨月自动换新文件
@@ -145,6 +228,7 @@ def main(argv: list[str]) -> int:
             n_trials=n_trials, n_stocks=n_stocks,
             output_path=str(raw_path), partial_path=str(partial_path),
             states=states, keep_partial=keep_partial,
+            validation_after=validation_after,
         )
     except Exception as exc:
         evaluation = {"candidate_id": candidate_id, "decision": "rejected", "reason": f"优化异常：{type(exc).__name__}: {exc}"}

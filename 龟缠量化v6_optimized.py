@@ -44,6 +44,7 @@ from scripts.causal_backtest import (
     stop_fill_price,
 )
 from scripts.trading_rules import calc_trade_cost as _shared_calc_trade_cost
+from scripts.candidate_engine import MIN_WALK_FORWARD_FOLDS
 
 _cfg = load_config()
 
@@ -3132,7 +3133,7 @@ def backtest_multi_stocks(codes, params, data_dict=None, start_date=None, end_da
 
 # ============ Optuna 优化 ============
 def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=50,
-                       calendar_dates=None, universe_by_date=None):
+                       calendar_dates=None, universe_by_date=None, validation_after=None):
     """
     对单个市场状态优化参数
     state_dates: 该状态所有日期列表 ['2023-01-03', ...]
@@ -3150,6 +3151,9 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
     })
     try:
         folds, sealed_dates = build_walk_forward_folds(calendar_dates)
+        if validation_after:
+            folds = [fold for fold in folds
+                     if str(fold.validation_start)[:10] > validation_after]
     except ValueError as exc:
         print(f"严格walk-forward不可用：{exc}")
         return {
@@ -3159,7 +3163,19 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
             'baseline_val_sharpe': 0, 'baseline_val_return': 0,
             'baseline_val_drawdown': 0, 'baseline_val_trades': 0,
             'baseline_val_win_rate': 0, 'val_win_rate': 0,
-            'fold_metrics': [], 'validation_protocol': 'wf-v2',
+            'fold_metrics': [], 'validation_protocol': 'wf-v3',
+            'sealed_period': None,
+        }
+    if not folds:
+        return {
+            'state': state_name, 'params': bp.copy(), 'status': 'research_only',
+            'reason': '没有未消费的滚动验证折', 'train_sharpe': -10,
+            'val_sharpe': -10, 'val_return': 0, 'val_drawdown': 0,
+            'val_trades': 0, 'baseline_val_sharpe': 0,
+            'baseline_val_return': 0, 'baseline_val_drawdown': 0,
+            'baseline_val_trades': 0, 'baseline_val_win_rate': 0,
+            'val_win_rate': 0, 'fold_metrics': [],
+            'eligible_fold_count': 0, 'validation_protocol': 'wf-v3',
             'sealed_period': None,
         }
     state_entry_dates = {pd.Timestamp(d) for d in state_dates}
@@ -3239,6 +3255,18 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
     for fold_number, fold in enumerate(folds, 1):
         train_entries = {d for d in state_entry_dates
                          if fold.train_start <= d <= fold.train_end}
+        validation_entries = {d for d in state_entry_dates
+                              if fold.validation_start <= d <= fold.validation_end}
+        if not validation_entries:
+            fold_metrics.append({
+                'fold': fold_number,
+                'train_start': str(fold.train_start)[:10], 'train_end': str(fold.train_end)[:10],
+                'val_start': str(fold.validation_start)[:10],
+                'val_end': str(fold.validation_end)[:10],
+                'eligible': False, 'validation_state_days': 0,
+                'excess_sharpe_positive': False,
+            })
+            continue
 
         def objective(trial):
             params = suggest_params(trial)
@@ -3259,8 +3287,6 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
         fold_params = study.best_params
         best_params = fold_params
         best_train_sharpe = float(study.best_value)
-        validation_entries = {d for d in state_entry_dates
-                              if fold.validation_start <= d <= fold.validation_end}
         val = backtest_multi_stocks(
             all_codes, fold_params, data_dict,
             start_date=fold.validation_start, end_date=fold.validation_end,
@@ -3273,6 +3299,7 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
         ) or {'sharpe': -10, 'total_return': 0, 'trades': 0, 'max_drawdown': 0, 'win_rate': 0}
         fold_metrics.append({
             'fold': fold_number,
+            'eligible': True, 'validation_state_days': len(validation_entries),
             'train_start': str(fold.train_start)[:10], 'train_end': str(fold.train_end)[:10],
             'val_start': str(fold.validation_start)[:10], 'val_end': str(fold.validation_end)[:10],
             'train_sharpe': round(best_train_sharpe, 3),
@@ -3302,14 +3329,19 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
             'win_rate': round(wins / trades * 100, 1) if trades else 0,
         }
 
-    val_result = _aggregate(fold_metrics)
-    baseline_val = _aggregate(fold_metrics, 'baseline_')
-    positive_folds = sum(bool(row['excess_sharpe_positive']) for row in fold_metrics)
-    required_positive = (len(fold_metrics) * 2 + 2) // 3
-    status = 'adopted' if positive_folds >= required_positive else 'rejected'
+    eligible_metrics = [row for row in fold_metrics if row['eligible']]
+    empty_result = {'sharpe': 0, 'total_return': 0, 'max_drawdown': 0,
+                    'trades': 0, 'win_rate': 0}
+    val_result = _aggregate(eligible_metrics) if eligible_metrics else empty_result
+    baseline_val = _aggregate(eligible_metrics, 'baseline_') if eligible_metrics else empty_result
+    positive_folds = sum(bool(row['excess_sharpe_positive']) for row in eligible_metrics)
+    required_positive = (len(eligible_metrics) * 2 + 2) // 3
+    status = ('adopted' if len(eligible_metrics) >= MIN_WALK_FORWARD_FOLDS
+              and positive_folds >= required_positive else 'rejected')
     if status != 'adopted':
         best_params = bp.copy()
-    print(f"滚动验证: {positive_folds}/{len(fold_metrics)}折超额夏普为正；"
+    print(f"滚动验证: {positive_folds}/{len(eligible_metrics)}有效折超额夏普为正"
+          f"（总计{len(fold_metrics)}折）；"
           f"交易={val_result['trades']}；状态={status}")
 
     return {
@@ -3330,9 +3362,10 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
         'train_period': f"{folds[0].train_start}~{folds[-1].train_end}",
         'val_period': f"{folds[0].validation_start}~{folds[-1].validation_end}",
         'fold_metrics': fold_metrics,
+        'eligible_fold_count': len(eligible_metrics),
         'positive_excess_folds': positive_folds,
         'required_positive_folds': required_positive,
-        'validation_protocol': 'wf-v2',
+        'validation_protocol': 'wf-v3',
         'sealed_period': {
             'start': str(sealed_dates[0])[:10], 'end': str(sealed_dates[-1])[:10],
             'trading_days': len(sealed_dates), 'status': 'unread',
@@ -3342,7 +3375,8 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
 
 # ============ 主流程 ============
 def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=200,
-                     output_path=None, partial_path=None, states=None, keep_partial=False):
+                     output_path=None, partial_path=None, states=None, keep_partial=False,
+                     validation_after=None):
     """
     完整优化流程
     1. 加载数据
@@ -3475,6 +3509,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
     # 断点续跑：加载已有结果
     partial_file = partial_path or os.path.join(DATA_DIR, "optimization_partial.json")
     results = []
+    skipped_states = []
     completed_states = set()
     if os.path.exists(partial_file):
         try:
@@ -3489,9 +3524,11 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
         except:
             pass
 
-    for state in states:
+    for state_index, state in enumerate(states):
         if fail_fast and any(r.get('status') == 'rejected' for r in results):
             print('已有状态未通过滚动验证，候选提前拒绝')
+            skipped_states.extend({'state': name, 'reason': '前置状态未通过，提前停止'}
+                                  for name in states[state_index:])
             break
         if state in completed_states:
             print(f"\n{state} 已完成，跳过")
@@ -3502,6 +3539,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
                        if t['state'] == state and evaluation_start <= t['date'] <= str(development_end)[:10]]
         if len(state_dates) < 30:
             print(f"\n{state} 状态仅{len(state_dates)}天，数据不足，跳过")
+            skipped_states.append({'state': state, 'reason': f'仅{len(state_dates)}个可入场日'})
             continue
 
         result = optimize_for_state(
@@ -3512,6 +3550,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             n_trials=n_trials if not test_mode else 10,
             calendar_dates=calendar_dates,
             universe_by_date=universe_by_date,
+            validation_after=validation_after,
         )
         results.append(result)
         
@@ -3537,12 +3576,13 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
         'optimization_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'baseline_params': BASELINE_PARAMS,
         'results': results,
+        'skipped_states': skipped_states,
         'n_stocks': len(data_dict),
         'n_trials': n_trials,
         'stock_codes': all_codes_list,
         'data_snapshot_hash': data_snapshot_hash,
         'point_in_time_universe': universe_meta,
-        'validation_protocol': 'wf-v2',
+        'validation_protocol': 'wf-v3',
     }
 
     final_output_path = output_path or PARAMS_FILE

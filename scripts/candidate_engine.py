@@ -27,13 +27,15 @@ def evaluate_backtest(output: dict) -> dict:
     by_state = {r.get("state"): r for r in output.get("results", [])}
     missing = [s for s in REQUIRED_STATES if s not in by_state]
     failures: list[str] = []
-    if output.get("validation_protocol") != "wf-v2":
-        failures.append("验证协议不是wf-v2")
+    if output.get("validation_protocol") != "wf-v3":
+        failures.append("验证协议不是wf-v3")
     universe = output.get("point_in_time_universe") or {}
     if not universe.get("complete"):
         failures.append("历史时点股票池不完整")
     if missing:
-        failures.append("市场状态覆盖不足：" + "、".join(missing))
+        skipped = {r.get("state"): r.get("reason") for r in output.get("skipped_states", [])}
+        failures.append("市场状态未评估：" + "、".join(
+            f"{state}（{skipped[state]}）" if skipped.get(state) else state for state in missing))
 
     rows = [by_state[s] for s in REQUIRED_STATES if s in by_state]
     total_trades = sum(int(r.get("val_trades", 0) or 0) for r in rows)
@@ -52,10 +54,15 @@ def evaluate_backtest(output: dict) -> dict:
         if r.get("status") != "adopted":
             row_failures.append("walk-forward未通过")
         fold_metrics = r.get("fold_metrics") or []
-        if len(fold_metrics) < MIN_WALK_FORWARD_FOLDS:
-            row_failures.append(f"滚动验证少于{MIN_WALK_FORWARD_FOLDS}折")
-        required_positive = (len(fold_metrics) * 2 + 2) // 3 if fold_metrics else MIN_WALK_FORWARD_FOLDS
-        positive = sum(bool(f.get("excess_sharpe_positive")) for f in fold_metrics)
+        if any(f.get("eligible") is not (int(f.get("validation_state_days", 0)) > 0)
+               for f in fold_metrics):
+            row_failures.append("滚动验证折状态标记不完整")
+        eligible_folds = [f for f in fold_metrics if f.get("eligible") is True
+                          and int(f.get("validation_state_days", 0)) > 0]
+        if len(eligible_folds) < MIN_WALK_FORWARD_FOLDS:
+            row_failures.append(f"有效滚动验证少于{MIN_WALK_FORWARD_FOLDS}折")
+        required_positive = (len(eligible_folds) * 2 + 2) // 3 if eligible_folds else MIN_WALK_FORWARD_FOLDS
+        positive = sum(bool(f.get("excess_sharpe_positive")) for f in eligible_folds)
         if positive < required_positive:
             row_failures.append("超额夏普为正的折数不足三分之二")
         if int(r.get("val_trades", 0) or 0) < MIN_STATE_OOS_TRADES:
