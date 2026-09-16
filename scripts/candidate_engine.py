@@ -8,6 +8,8 @@ from pathlib import Path
 
 REQUIRED_STATES = ("bull", "bear", "sideways")
 MIN_OOS_TRADES = 40
+MIN_STATE_OOS_TRADES = 10
+MIN_WALK_FORWARD_FOLDS = 3
 MIN_SHADOW_CLOSED_TRADES = 20
 MAX_DRAWDOWN_PCT = 10.0
 MIN_SHARPE_IMPROVEMENT = 0.10
@@ -25,6 +27,11 @@ def evaluate_backtest(output: dict) -> dict:
     by_state = {r.get("state"): r for r in output.get("results", [])}
     missing = [s for s in REQUIRED_STATES if s not in by_state]
     failures: list[str] = []
+    if output.get("validation_protocol") != "wf-v2":
+        failures.append("验证协议不是wf-v2")
+    universe = output.get("point_in_time_universe") or {}
+    if not universe.get("complete"):
+        failures.append("历史时点股票池不完整")
     if missing:
         failures.append("市场状态覆盖不足：" + "、".join(missing))
 
@@ -44,6 +51,15 @@ def evaluate_backtest(output: dict) -> dict:
         row_failures = []
         if r.get("status") != "adopted":
             row_failures.append("walk-forward未通过")
+        fold_metrics = r.get("fold_metrics") or []
+        if len(fold_metrics) < MIN_WALK_FORWARD_FOLDS:
+            row_failures.append(f"滚动验证少于{MIN_WALK_FORWARD_FOLDS}折")
+        required_positive = (len(fold_metrics) * 2 + 2) // 3 if fold_metrics else MIN_WALK_FORWARD_FOLDS
+        positive = sum(bool(f.get("excess_sharpe_positive")) for f in fold_metrics)
+        if positive < required_positive:
+            row_failures.append("超额夏普为正的折数不足三分之二")
+        if int(r.get("val_trades", 0) or 0) < MIN_STATE_OOS_TRADES:
+            row_failures.append(f"样本外交易少于{MIN_STATE_OOS_TRADES}笔")
         if not _sharpe_pass(sharpe, baseline_sharpe):
             row_failures.append("夏普未提升10%")
         if ret < baseline_ret:
@@ -71,6 +87,8 @@ def evaluate_backtest(output: dict) -> dict:
         "state_metrics": state_metrics,
         "thresholds": {
             "min_oos_closed_trades": MIN_OOS_TRADES,
+            "min_state_oos_closed_trades": MIN_STATE_OOS_TRADES,
+            "min_walk_forward_folds": MIN_WALK_FORWARD_FOLDS,
             "min_shadow_closed_trades": MIN_SHADOW_CLOSED_TRADES,
             "min_sharpe_improvement": MIN_SHARPE_IMPROVEMENT,
             "max_drawdown_pct": MAX_DRAWDOWN_PCT,

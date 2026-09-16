@@ -7,3 +7,4 @@ schedule>=1.2
 matplotlib>=3.6
 PyYAML>=6
 plyer>=2.0
+baostock>=0.8.9

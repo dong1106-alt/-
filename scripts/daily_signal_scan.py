@@ -795,36 +795,15 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ===================== 缠论核心（移植自v6_optimized） =====================
 def merge_kline_include(df: pd.DataFrame) -> pd.DataFrame:
-    """合并K线包含关系（优化版：栈式O(n)算法，替代原DataFrame.drop O(n²)）"""
-    highs = df["high"].values.tolist()
-    lows = df["low"].values.tolist()
-    if len(highs) < 2:
-        return pd.DataFrame({"high": highs, "low": lows})
-
-    stack_h = [highs[0]]
-    stack_l = [lows[0]]
-
-    for i in range(1, len(highs)):
-        h1, l1 = highs[i], lows[i]
-        merged = False
-        while stack_h:
-            h0, l0 = stack_h[-1], stack_l[-1]
-            if h0 >= h1 and l0 <= l1:
-                # 栈顶包含当前K线：跳过当前（保留栈顶范围）
-                merged = True
-                break
-            elif h1 >= h0 and l1 <= l0:
-                # 当前包含栈顶：弹出栈顶，继续检查
-                stack_h.pop()
-                stack_l.pop()
-            else:
-                # 无包含关系：压入当前
-                break
-        if not merged:
-            stack_h.append(h1)
-            stack_l.append(l1)
-
-    return pd.DataFrame({"high": stack_h, "low": stack_l})
+    """等长因果合并：当前bar可继承前值，绝不回写或删除历史bar。"""
+    bars = df[["high", "low"]].copy().reset_index(drop=True)
+    for i in range(1, len(bars)):
+        h0, l0 = bars.loc[i - 1, "high"], bars.loc[i - 1, "low"]
+        h1, l1 = bars.loc[i, "high"], bars.loc[i, "low"]
+        if h0 >= h1 and l0 <= l1:
+            bars.loc[i, "high"] = h0
+            bars.loc[i, "low"] = l0
+    return bars
 
 
 def find_pivots_enhanced(df: pd.DataFrame) -> Tuple[List[int], List[int]]:
@@ -895,7 +874,9 @@ def detect_chan_signals(df: pd.DataFrame, pivot_win: int = 5, chan_threshold: fl
         a1 = calc_macd_area_section(df, i1, pivot_win + 2, True)
         a2 = calc_macd_area_section(df, i2, pivot_win + 2, True)
         if a2 < a1 * chan_threshold:
-            cfm = min(i2 + pivot_win, n - 1)
+            cfm = i2 + pivot_win
+            if cfm >= n:
+                continue
             df.loc[cfm, "chan_buy"] = True
             df.loc[cfm, "chan_buy_type"] = "一买(底背离)"
 
@@ -942,7 +923,9 @@ def detect_chan_signals(df: pd.DataFrame, pivot_win: int = 5, chan_threshold: fl
         a1 = calc_macd_area_section(df, i1, pivot_win + 2, False)
         a2 = calc_macd_area_section(df, i2, pivot_win + 2, False)
         if a2 < a1 * 0.8:
-            cfm = min(i2 + pivot_win, n - 1)
+            cfm = i2 + pivot_win
+            if cfm >= n:
+                continue
             df.loc[cfm, "chan_sell"] = True
 
     return df
@@ -1698,8 +1681,9 @@ async def main():
         codes = []
         code_name_map = {}
         import os as _os
-        if _os.path.exists(MAIN_BOARD_FILE):
-            with open(MAIN_BOARD_FILE, "r") as f:
+        pool_file = _os.environ.get("SHADOW_STOCK_POOL_FILE", MAIN_BOARD_FILE)
+        if _os.path.exists(pool_file):
+            with open(pool_file, "r") as f:
                 for line in f:
                     line = line.strip()
                     if not line:

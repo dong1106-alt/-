@@ -16,6 +16,7 @@ import subprocess
 import sys
 import os
 import argparse
+import hashlib
 
 # 持久化第三方库路径（optuna等，避免沙箱重启后重装）
 _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python_libs')
@@ -34,6 +35,14 @@ import matplotlib
 # 【修改】删除所有硬编码路径，改用 config/loader.py 统一管理
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.loader import load_config, get_config, get_path
+from scripts.causal_backtest import (
+    STRICT_EVALUATION_START,
+    assert_causal_fills,
+    build_walk_forward_folds,
+    execute_fill,
+    is_tradable_bar,
+    stop_fill_price,
+)
 from scripts.trading_rules import calc_trade_cost as _shared_calc_trade_cost
 
 _cfg = load_config()
@@ -459,22 +468,12 @@ def calc_adaptive_params(df, idx, st_cfg, market_slope=0, volatility_index=1.0):
 # ===================== 缠论核心 =====================
 def merge_kline_include(df: pd.DataFrame) -> pd.DataFrame:
     bars = df[["high", "low"]].copy().reset_index(drop=True)
-    i = 1
-    while i < len(bars) - 1:
-        h0, l0 = bars.loc[i-1, "high"], bars.loc[i-1, "low"]
+    for i in range(1, len(bars)):
+        h0, l0 = bars.loc[i - 1, "high"], bars.loc[i - 1, "low"]
         h1, l1 = bars.loc[i, "high"], bars.loc[i, "low"]
         if h0 >= h1 and l0 <= l1:
             bars.loc[i, "high"] = h0
             bars.loc[i, "low"] = l0
-            bars = bars.drop(i-1).reset_index(drop=True)
-            i = max(1, i - 1)
-        elif h1 >= h0 and l1 <= l0:
-            bars.loc[i-1, "high"] = h1
-            bars.loc[i-1, "low"] = l1
-            bars = bars.drop(i).reset_index(drop=True)
-            i = max(1, i - 1)
-        else:
-            i += 1
     return bars
 
 def find_pivots_enhanced(df: pd.DataFrame) -> Tuple[List[int], List[int]]:
@@ -541,7 +540,9 @@ def detect_chan_signals_optimized(df, pivot_win=5, chan_threshold=0.70):
         a1 = calc_macd_area_section(df, i1, pivot_win+2, True)
         a2 = calc_macd_area_section(df, i2, pivot_win+2, True)
         if a2 < a1 * chan_threshold:
-            cfm = min(i2 + pivot_win, n-1)
+            cfm = i2 + pivot_win
+            if cfm >= n:
+                continue
             df.loc[cfm, "chan_buy"] = True
             df.loc[cfm, "chan_buy_type"] = "一买(底背离)"
 
@@ -585,7 +586,9 @@ def detect_chan_signals_optimized(df, pivot_win=5, chan_threshold=0.70):
         a1 = calc_macd_area_section(df, i1, pivot_win+2, False)
         a2 = calc_macd_area_section(df, i2, pivot_win+2, False)
         if a2 < a1 * 0.8:
-            cfm = min(i2 + pivot_win, n-1)
+            cfm = i2 + pivot_win
+            if cfm >= n:
+                continue
             df.loc[cfm, "chan_sell"] = True
     return df
 
@@ -1140,8 +1143,9 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                         params = calc_adaptive_params(df_s, idx, _st_cfg, market_slope, volatility_index)
                     apl.append(params)
 
-                avg_threshold = np.mean([p['chan_threshold'] for p in apl[30:]]) if len(df_s) > 30 else 0.70
-                df_s = detect_chan_signals_optimized(df_s, pivot_win=5, chan_threshold=avg_threshold)
+                df_s = detect_chan_signals_optimized(
+                    df_s, pivot_win=5, chan_threshold=_st_cfg.get('base_chan_threshold', 0.70)
+                )
                 # 【新增】注入mc_est供gen_signal_enhanced按市值分档
                 _st_cfg['mc_est'] = estimate_market_cap(df_raw['close'].iloc[0])
                 df_s = gen_signal_enhanced(df_s, _st_cfg, apl[-1] if apl else {})
@@ -1179,13 +1183,9 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             # 重新计算default指标用于ATR%（只用回测前数据）
             _df_for_atr = calc_indicators_vec(_full_df, st_cfg)
             pre_atr_df = _df_for_atr[_df_for_atr['date'] < bt_start]
-            if len(pre_atr_df) > 20:
-                valid_atr = pre_atr_df['atr'].dropna()
-            else:
-                valid_atr = _default_df_s['bt_df']['atr'].dropna()
+            valid_atr = pre_atr_df['atr'].dropna() if len(pre_atr_df) > 20 else pd.Series(dtype=float)
             if len(valid_atr) > 0:
-                valid_close = (pre_atr_df['close'].loc[valid_atr.index] if len(pre_atr_df) > 20
-                               else _default_df_s['bt_df']['close'].loc[valid_atr.index])
+                valid_close = pre_atr_df['close'].loc[valid_atr.index]
                 stock_atr_pct = float((valid_atr / valid_close * 100).mean())
             else:
                 stock_atr_pct = 0
@@ -1230,11 +1230,16 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
     _peak_equity = init_cap
     _circuit_stop_until = None  # datetime.date; 该日期之前（含当日）不开新仓
     _halved_peak = None  # 记录上一次已触发减半时的peak，避免重复减半
+    pending_circuit = {}
+    causal_fill_records = []
 
-    for dt in all_dates:
-        # 查找当前日期的市场状态
+    for _date_pos, dt in enumerate(all_dates):
+        # 开盘成交只能使用上一交易日收盘后已确定的市场状态。
         dt_str = dt.strftime('%Y-%m-%d') if hasattr(dt, 'strftime') else str(dt)[:10]
-        current_state = date_to_state.get(dt_str, None)
+        _signal_dt = all_dates[_date_pos - 1] if _date_pos > 0 else None
+        _signal_dt_str = (_signal_dt.strftime('%Y-%m-%d') if hasattr(_signal_dt, 'strftime')
+                          else str(_signal_dt)[:10]) if _signal_dt is not None else ''
+        current_state = date_to_state.get(_signal_dt_str, None)
         if not current_state:
             current_state = '_default'
 
@@ -1253,9 +1258,10 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             bt_idx = _st_dsi.get(dt)
             if bt_idx is not None:
                 row = _st_sd['bt_df'].iloc[bt_idx]
+                if not is_tradable_bar(row.get('open'), row.get('volume', 1)):
+                    continue
                 daily_rows[code] = (bt_idx, row)
                 daily_state_sd[code] = _st_sd
-                last_known_close[code] = row["close"]
 
         if not daily_rows:
             continue
@@ -1265,14 +1271,19 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             sd = stock_data[code]
             _st_sd = daily_state_sd[code]
             _st_cfg = _st_sd['st_cfg']
-            close = row["close"]
+            # 当前bar只提供开盘成交与盘中止损；所有决策字段来自上一根已完成bar。
+            if bt_idx <= 0:
+                continue
+            signal_row = _st_sd['bt_df'].iloc[bt_idx - 1]
+            signal_date = pd.Timestamp(signal_row["date"])
+            close = signal_row["close"]
             low = row["low"]
-            high = row["high"]
-            atr = row["atr"]
-            pos_scale = row.get("position_scale", 0.5)
-            trend_strength = row.get("trend_strength", 0)
+            high = signal_row["high"]
+            atr = signal_row["atr"]
+            pos_scale = signal_row.get("position_scale", 0.5)
+            trend_strength = signal_row.get("trend_strength", 0)
 
-            volatility_percentile = row.get("volatility_percentile", 0.5)
+            volatility_percentile = signal_row.get("volatility_percentile", 0.5)
             vol_adaptive = st_cfg.get('volatility_adaptive', True)
             vol_stop_min = st_cfg.get('volatility_stop_multiplier_min', 1.5)
             vol_stop_max = st_cfg.get('volatility_stop_multiplier_max', 3.0)
@@ -1288,7 +1299,8 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
 
             adaptive_params_list = _st_sd['adaptive_params_list']
             mask_start = _st_sd['mask_start']
-            params = adaptive_params_list[bt_idx + mask_start] if bt_idx + mask_start < len(adaptive_params_list) else {
+            _decision_idx = bt_idx + mask_start - 1
+            params = adaptive_params_list[_decision_idx] if _decision_idx < len(adaptive_params_list) else {
                 'risk_pct': 0.10, 'stop_multiplier': 2.0, 'chan_threshold': 0.70,
                 'add_threshold': 0.06, 'take_profit_threshold': 0.40,
                 'high_vol_risk_reduce': 1.0, 'r2_20': 0.0
@@ -1317,7 +1329,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 pos_scale = pos_scale * 0.6
 
             # 【新增】风险值仓位调整（借鉴中和应泰强龙风控，自适应）
-            risk_val = row.get("risk_value", 50)
+            risk_val = signal_row.get("risk_value", 50)
             if pd.isna(risk_val):
                 risk_val = 50
             risk_ban = _st_cfg.get('risk_value_ban', 80)
@@ -1326,7 +1338,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 pos_scale *= 0.5  # 警戒区仓位减半
 
             # 【新增】量比仓位调整（借鉴中和应泰强龙换手）
-            vol_turn = row.get("vol_turnover", 1.0)
+            vol_turn = signal_row.get("vol_turnover", 1.0)
             if pd.isna(vol_turn):
                 vol_turn = 1.0
             if vol_turn > 15:
@@ -1334,7 +1346,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             # vol_turn < 0.5 在买入时跳过（流动性不足）
 
             # 【新增】信号置信度仓位（借鉴中和应泰无强扭转应对法则，自适应）
-            entry_score = row.get("entry_score", 3.0)
+            entry_score = signal_row.get("entry_score", 3.0)
             if pd.isna(entry_score):
                 entry_score = 3.0
             score_thresh = _st_cfg.get('score_threshold', 2.0)
@@ -1357,7 +1369,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             if _cur_st_sd_r2 is not None:
                 _full_df_r2 = _cur_st_sd_r2.get('full_df', _cur_st_sd_r2['bt_df'])
                 _ms_r2 = _cur_st_sd_r2.get('mask_start', 0)
-                _full_idx_r2 = _ms_r2 + bt_idx
+                _full_idx_r2 = _ms_r2 + bt_idx - 1
                 _r2_lookback = min(120, _full_idx_r2 + 1)
                 _r2_closes = _full_df_r2['close'].iloc[max(0, _full_idx_r2 - _r2_lookback + 1):_full_idx_r2 + 1].values.tolist()
                 current_r2_120 = calc_r2(_r2_closes, lookback=120)
@@ -1365,26 +1377,28 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 current_r2_120 = 0.0
 
             daily_params[code] = {
+                'open': row.get("open", row["close"]),
                 'close': close, 'low': low, 'high': high, 'atr': atr,
                 'pos_scale': pos_scale, 'trend_strength': trend_strength,
                 'risk_pct': risk_pct, 'stop_multiplier': stop_multiplier,
                 'add_threshold': add_threshold, 'take_profit_threshold': take_profit_threshold,
                 'take_profit_pct': take_profit_pct,
-                'buy_signal': row.get("buy_signal", False),
-                'sell_signal': row.get("sell_signal", False),
-                'chan_recent_type': row.get("chan_recent_type", ""),
+                'buy_signal': signal_row.get("buy_signal", False),
+                'sell_signal': signal_row.get("sell_signal", False),
+                'chan_recent_type': signal_row.get("chan_recent_type", ""),
                 'vol_turnover': vol_turn,  # 【新增】量比
                 'risk_value': risk_val,    # 【新增】风险值
-                'ma20': row.get("ma20", close),       # 【新增】阶梯止盈用
-                'ma60': row.get("ma60", close),       # 【新增】趋势锁仓用
-                'ma20_slope': row.get("ma20_slope", 0), # 【新增】趋势锁仓用
+                'ma20': signal_row.get("ma20", close),
+                'ma60': signal_row.get("ma60", close),
+                'ma20_slope': signal_row.get("ma20_slope", 0),
                 'r2_120_rolling': current_r2_120,     # 【L2修复】滚动120日R²
+                'signal_date': signal_date,
             }
 
         # 卖出
         to_del = []
         for c, pos in list(positions.items()):
-            if c not in daily_rows:
+            if c not in daily_params:
                 continue
 
             dp = daily_params[c]
@@ -1392,12 +1406,13 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             mc_est = sd['mc_est']
             close = dp['close']
             low = dp['low']
+            open_price = dp['open']
 
             t = pos.trade
             sl = t.stop_loss
             sell_flag = False
             sell_reason = ""
-            sell_price = close
+            sell_price = open_price
             sell_shares = pos.current_shares
 
             # 【优化4】动态阶梯止盈触发线：强趋势提高至25%，弱趋势降低至10%
@@ -1425,25 +1440,20 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 if t.buy_price > sl:
                     sl = t.buy_price
             # pnl <= 0.05：保持原ATR止损不变
+            if sl > t.stop_loss:
+                t.stop_loss = sl
+                setattr(t, 'stop_signal_date', dp['signal_date'])
 
-            if low <= sl:
-                sell_flag = True
-                sell_price = sl
-                if pnl > _tier_trigger:
-                    sell_reason = f"阶梯止盈(MA20×0.98) {sl:.2f}"
-                elif pnl > 0.05:
-                    sell_reason = f"保本止损 {sl:.2f}"
-                else:
-                    sell_reason = f"ATR止损 {sl:.2f}"
-
-            # 动态止盈（部分卖出）保持不变
-            if not sell_flag and not t.partial_sold:
+            # 上一收盘已形成的退出决策优先在今日开盘执行。
+            fill_source = 'next_open'
+            signal_date = dp['signal_date']
+            if not t.partial_sold:
                 pnl_pct = (close - t.buy_price) / t.buy_price
                 if pnl_pct > dp['take_profit_threshold']:
                     sell_shares = int(pos.current_shares * dp['take_profit_pct'])
                     if sell_shares >= 100:
                         sell_flag = True
-                        sell_price = close
+                        sell_price = open_price
                         sell_reason = f"动态止盈(卖{int(dp['take_profit_pct']*100)}%)"
                         t.partial_sold = True
                         t.remaining_shares = pos.current_shares - sell_shares
@@ -1453,13 +1463,33 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
 
             if dp['sell_signal'] and not sell_flag and not trend_lock:
                 sell_flag = True
+                sell_price = open_price
                 sell_reason = "海龟退出/缠论顶背离"
                 sell_shares = pos.current_shares
 
+            # 没有收盘退出订单时，再检查今日盘中的既有止损。
+            if not sell_flag:
+                raw_stop_fill = stop_fill_price(open_price, low, t.stop_loss)
+                if raw_stop_fill is not None:
+                    sell_flag = True
+                    sell_price = raw_stop_fill
+                    signal_date = getattr(t, 'stop_signal_date', t.buy_date)
+                    fill_source = 'gap_stop' if open_price <= t.stop_loss else 'intraday_stop'
+                    if pnl > _tier_trigger:
+                        sell_reason = f"阶梯止盈(MA20×0.98) {t.stop_loss:.2f}"
+                    elif pnl > 0.05:
+                        sell_reason = f"保本止损 {t.stop_loss:.2f}"
+                    else:
+                        sell_reason = f"ATR止损 {t.stop_loss:.2f}"
+
             if sell_flag and sell_shares > 0:
-                exec_sell, net_sell, comm, tax = calc_trade_cost(
-                    sell_price, sell_shares, "sell", trade_cfg, mc_est
+                (exec_sell, net_sell, comm, tax), fill = execute_fill(
+                    side="sell", signal_date=signal_date, fill_date=pd.Timestamp(dt),
+                    fill_source=fill_source, open_price=open_price, low_price=low,
+                    stop_price=t.stop_loss, shares=sell_shares, trade_cfg=trade_cfg,
+                    market_cap=mc_est,
                 )
+                causal_fill_records.append(fill)
                 capital += net_sell
                 if sell_shares == pos.current_shares:
                     t.sell_date = dt
@@ -1495,31 +1525,27 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
 
         for c in to_del:
             del positions[c]
+            pending_circuit.pop(c, None)
 
-        # 【变更4】账户级回撤熔断 — 在今日卖出执行完毕、买入之前
-        _mv = 0.0
-        for _cc, _pp in positions.items():
-            if _cc in daily_rows:
-                _mv += _pp.current_shares * daily_rows[_cc][1]["close"]
-            elif _cc in last_known_close:
-                _mv += _pp.current_shares * last_known_close[_cc]
-        _equity_today = capital + _mv
-        if _equity_today > _peak_equity:
-            _peak_equity = _equity_today
-        _dd_now = (_equity_today - _peak_equity) / _peak_equity if _peak_equity > 0 else 0.0
-
-        # 触发清仓熔断：清仓并停止开新仓至当月末
-        if _dd_now <= -_dd_stop and positions:
+        # 上一收盘触发的熔断在今日开盘执行，停牌订单保留。
+        stop_orders = {c: order for c, order in pending_circuit.items() if order['action'] == 'stop'}
+        if stop_orders:
             _cb_to_del = []
-            for _cc, _pp in list(positions.items()):
-                if _cc not in daily_rows:
+            for _cc, order in list(stop_orders.items()):
+                if _cc not in daily_rows or _cc not in positions:
                     continue
+                _pp = positions[_cc]
                 _row_c = daily_rows[_cc][1]
                 _sd_c = stock_data[_cc]
                 _mc_c = _sd_c['mc_est']
-                _px_c = _row_c["close"]
+                _px_c = _row_c["open"]
                 _sh_c = _pp.current_shares
-                _ex, _net, _comm, _tax = calc_trade_cost(_px_c, _sh_c, "sell", trade_cfg, _mc_c)
+                (_ex, _net, _comm, _tax), fill = execute_fill(
+                    side="sell", signal_date=order['signal_date'], fill_date=pd.Timestamp(dt),
+                    fill_source="next_open", open_price=_px_c, shares=_sh_c,
+                    trade_cfg=trade_cfg, market_cap=_mc_c,
+                )
+                causal_fill_records.append(fill)
                 capital += _net
                 _tt = _pp.trade
                 _tt.sell_date = dt
@@ -1527,34 +1553,34 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 _tt.sell_value = _net
                 _tt.pnl = _net - _pp.cost_total
                 _tt.pnl_pct = _tt.pnl / _pp.cost_total * 100
-                _tt.sell_reason = f"熔断清仓(DD{_dd_now*100:.1f}%)"
+                _tt.sell_reason = f"熔断清仓(DD{order['drawdown']*100:.1f}%)"
                 _tt.holding_days = (dt - _tt.buy_date).days
                 all_trades.append(_tt)
                 _cb_to_del.append(_cc)
             for _cc in _cb_to_del:
                 del positions[_cc]
-            # 停止至当月末
-            if hasattr(dt, 'replace'):
-                if dt.month == 12:
-                    _circuit_stop_until = dt.replace(day=31)
-                else:
-                    _next_month = dt.replace(month=dt.month + 1, day=1)
-                    _circuit_stop_until = _next_month - timedelta(days=1)
+                pending_circuit.pop(_cc, None)
         # 触发减半熔断（peak创新高后重置，每个peak只减半一次）
-        elif _dd_now <= -_dd_halve and positions and _halved_peak != _peak_equity:
-            _halved_peak = _peak_equity
-            for _cc, _pp in list(positions.items()):
-                if _cc not in daily_rows:
+        elif pending_circuit:
+            for _cc, order in list(pending_circuit.items()):
+                if _cc not in daily_rows or _cc not in positions:
                     continue
+                _pp = positions[_cc]
                 _row_c = daily_rows[_cc][1]
                 _sd_c = stock_data[_cc]
                 _mc_c = _sd_c['mc_est']
-                _px_c = _row_c["close"]
+                _px_c = _row_c["open"]
                 _sh_c = _pp.current_shares
                 _half = (_sh_c // 2 // 100) * 100
                 if _half < 100:
+                    pending_circuit.pop(_cc, None)
                     continue
-                _ex, _net, _comm, _tax = calc_trade_cost(_px_c, _half, "sell", trade_cfg, _mc_c)
+                (_ex, _net, _comm, _tax), fill = execute_fill(
+                    side="sell", signal_date=order['signal_date'], fill_date=pd.Timestamp(dt),
+                    fill_source="next_open", open_price=_px_c, shares=_half,
+                    trade_cfg=trade_cfg, market_cap=_mc_c,
+                )
+                causal_fill_records.append(fill)
                 capital += _net
                 _orig_cost = _pp.cost_total
                 _pp.current_shares -= _half
@@ -1568,10 +1594,11 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                     sell_date=dt, sell_price=_ex, sell_value=_net,
                     pnl=_net - _orig_cost * (_half / _sh_c),
                     pnl_pct=(_ex - _tt.buy_price) / _tt.buy_price * 100,
-                    sell_reason=f"熔断减半(DD{_dd_now*100:.1f}%)",
+                    sell_reason=f"熔断减半(DD{order['drawdown']*100:.1f}%)",
                     holding_days=(dt - _tt.buy_date).days
                 )
                 all_trades.append(_partial)
+                pending_circuit.pop(_cc, None)
 
         # 熔断停止期内禁止开新仓
         _circuit_block_buy = False
@@ -1587,7 +1614,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
         max_concurrent = _cur_sp.get('max_concurrent_positions', st_cfg.get('max_concurrent_positions', 5))
         buy_candidates = sorted(
             [(code, bt_idx, row) for code, (bt_idx, row) in daily_rows.items()
-             if code in stock_data],
+             if code in stock_data and code in daily_params],
             key=lambda x: stock_data[x[0]]['score'],
             reverse=True
         )
@@ -1600,9 +1627,11 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
             sd = stock_data[code]
             mc_est = sd['mc_est']
             close = dp['close']
+            open_price = dp['open']
             high = dp['high']
             atr = dp['atr']
             pos_scale = dp['pos_scale']
+            opened_today = False
 
             # 【L2修复】滚动R² < 0.15时仓位减半（不直接跳过）
             _r2_120 = dp.get('r2_120_rolling', 0.0)
@@ -1617,14 +1646,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                     continue
                 if pd.isna(atr) or atr <= 0:
                     continue
-                # 【新增】ST/退市股票过滤
-                if st_cfg.get('exclude_st', True):
-                    try:
-                        from data.valuation import is_st_stock
-                        if is_st_stock(code):
-                            continue
-                    except Exception:
-                        pass
+                # 历史回测不可使用当前 ST 标记筛掉历史样本。
                 # 【新增】波动率过滤：ATR占股价比过低的大盘股跳过
                 _min_atr_pct = st_cfg.get('min_atr_pct', 0.015)
                 if atr / close < _min_atr_pct:
@@ -1637,14 +1659,16 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 # 【变更3】行业集中度检查：买入后该行业总仓位占比不得超过industry_max_pct
                 # 用当前权益（现金+持仓市值）作为分母
                 _eq_now = capital + sum(
-                    p.current_shares * daily_rows.get(cc, (None, {}))[1].get("close", last_known_close.get(cc, 0))
+                    p.current_shares * (daily_params[cc]['close'] if cc in daily_params
+                                        else last_known_close.get(cc, 0))
                     for cc, p in positions.items()
                 )
                 _new_industry = _get_industry(code)
                 _cur_ind_exposure = 0.0
                 for _ec, _ep in positions.items():
                     if _get_industry(_ec) == _new_industry:
-                        _epx = daily_rows.get(_ec, (None, {}))[1].get("close", last_known_close.get(_ec, 0))
+                        _epx = (daily_params[_ec]['close'] if _ec in daily_params
+                                else last_known_close.get(_ec, 0))
                         _cur_ind_exposure += _ep.current_shares * _epx
                 # 预估本次买入市值（与下面 max_cap_share 口径一致）
                 _est_new_value = capital * risk_cfg["single_max_pos"] * pos_scale
@@ -1656,7 +1680,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 if _cur_st_sd is not None and bt_idx >= 30:
                     _full_df = _cur_st_sd.get('full_df', _cur_st_sd['bt_df'])
                     _ms = _cur_st_sd.get('mask_start', 0)
-                    _full_idx = _ms + bt_idx
+                    _full_idx = _ms + bt_idx - 1
                     _lookback = min(250, _full_idx + 1)
                     _score_df = _full_df.iloc[max(0, _full_idx - _lookback + 1):_full_idx + 1]
                     if len(_score_df) >= 30:
@@ -1675,15 +1699,17 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                 risk_unit = capital * dp['risk_pct']
                 stop_dist = dp['stop_multiplier'] * atr
                 max_risk_share = int(risk_unit / stop_dist * pos_scale)
-                max_cap_share = int((capital * risk_cfg["single_max_pos"] * pos_scale) / close)
+                max_cap_share = int((capital * risk_cfg["single_max_pos"] * pos_scale) / open_price)
                 shares = min(max_risk_share, max_cap_share)
                 shares = (shares // 100) * 100
 
                 if shares < 100:
                     continue
 
-                exec_buy, cost_total, comm, tax = calc_trade_cost(
-                    close, shares, "buy", trade_cfg, mc_est
+                (exec_buy, cost_total, comm, tax), fill = execute_fill(
+                    side="buy", signal_date=dp['signal_date'], fill_date=pd.Timestamp(dt),
+                    fill_source="next_open", open_price=open_price, shares=shares,
+                    trade_cfg=trade_cfg, market_cap=mc_est,
                 )
                 if cost_total > capital:
                     continue
@@ -1697,13 +1723,16 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                     partial_sold=False,
                     remaining_shares=0
                 )
+                setattr(new_trade, 'stop_signal_date', dp['signal_date'])
                 positions[code] = Position(
                     code=code, trade=new_trade, cost_total=cost_total,
                     current_shares=shares
                 )
+                opened_today = True
+                causal_fill_records.append(fill)
 
             # 加仓
-            if code in positions and pos_scale > 0.5:
+            if code in positions and not opened_today and pos_scale > 0.5:
                 pos = positions[code]
                 t = pos.trade
                 if t.add_count < max_add:
@@ -1716,8 +1745,10 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                             if add_shares < 100:
                                 add_shares = t.shares // 3
                             if add_shares >= 100:
-                                exec_add, add_cost, _, _ = calc_trade_cost(
-                                    add_tp, add_shares, "buy", trade_cfg, mc_est
+                                (exec_add, add_cost, _, _), fill = execute_fill(
+                                    side="buy", signal_date=dp['signal_date'], fill_date=pd.Timestamp(dt),
+                                    fill_source="next_open", open_price=open_price,
+                                    shares=add_shares, trade_cfg=trade_cfg, market_cap=mc_est,
                                 )
                                 if add_cost <= capital:
                                     capital -= add_cost
@@ -1728,6 +1759,8 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
                                     t.stop_loss = avg_cost - dp['stop_multiplier'] * atr
                                     pos.cost_total = all_cost
                                     t.add_count += 1
+                                    setattr(t, 'stop_signal_date', dp['signal_date'])
+                                    causal_fill_records.append(fill)
 
         market_val = 0
         for c, p in positions.items():
@@ -1738,6 +1771,25 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
 
         daily_equity = capital + market_val
         equity_records.append({"date": dt, "equity": daily_equity})
+        for _cc, (_, _row) in daily_rows.items():
+            last_known_close[_cc] = _row['close']
+        _peak_equity = max(_peak_equity, daily_equity)
+        _dd_now = (daily_equity - _peak_equity) / _peak_equity if _peak_equity > 0 else 0.0
+        if _dd_now <= -_dd_stop and positions:
+            for _cc in positions:
+                pending_circuit[_cc] = {
+                    'action': 'stop', 'signal_date': pd.Timestamp(dt), 'drawdown': _dd_now,
+                }
+            if dt.month == 12:
+                _circuit_stop_until = dt.replace(day=31)
+            else:
+                _circuit_stop_until = dt.replace(month=dt.month + 1, day=1) - timedelta(days=1)
+        elif _dd_now <= -_dd_halve and positions and _halved_peak != _peak_equity:
+            _halved_peak = _peak_equity
+            for _cc in positions:
+                pending_circuit.setdefault(_cc, {
+                    'action': 'halve', 'signal_date': pd.Timestamp(dt), 'drawdown': _dd_now,
+                })
         # ============================================================
         # 【本地化适配】保存每日快照（供 performance_monitor 读取）
         # ============================================================
@@ -1785,6 +1837,7 @@ def run_multi_backtest(code_list, cfg, bt_start, bt_end):
         max_dd = 0
         max_dd_date = None
 
+    assert_causal_fills(causal_fill_records)
     final_cap = capital
     return all_trades, eq_df, final_cap, bt_df_dict, max_dd, max_dd_date
 
@@ -2619,7 +2672,8 @@ def get_state_for_date(date_str, timeline):
     return 'sideways'
 
 # ============ 快速回测引擎 ============
-def fast_backtest(df, params, initial_capital=500000, start_date=None, end_date=None):
+def fast_backtest(df, params, initial_capital=500000, start_date=None, end_date=None,
+                  entry_dates=None):
     """
     快速向量化回测，忠实v5.3.4.1核心交易逻辑
     参数：
@@ -2794,94 +2848,142 @@ def fast_backtest(df, params, initial_capital=500000, start_date=None, end_date=
         if (not pd.isna(exit_low.iloc[i])) and (df.loc[i, 'close'] < exit_low.iloc[i]):
             sell_signals[i] = True
     
-    # === 3. 模拟交易 ===
-    position = 0  # 持有股数
-    entry_price = 0
-    stop_loss = 0
-    entry_idx = 0  # 记录买入时的索引，用于追踪止盈
-    capital = initial_capital
+    # === 3. 因果模拟交易：收盘信号只允许在下一可交易日开盘成交 ===
+    position = 0
+    entry_price = 0.0
+    entry_cost = 0.0
+    entry_idx = 0
+    stop_loss = 0.0
+    stop_signal_date = None
+    cash = float(initial_capital)
     trades = []
+    fill_records = []
     equity_curve = []
-    
+    pending_buy = None
+    pending_sell = None
+    allowed_entry_dates = {pd.Timestamp(d) for d in entry_dates} if entry_dates is not None else None
+    trade_cfg = DEFAULT_CONFIG["trade_cost"]
+
     for i in range(n):
-        price = df.loc[i, 'close']
-        cur_date = df.loc[i, 'date']
-        # 窗口判断：指标已用全部历史算好，这里只限制交易/统计窗口
-        in_window = True
-        if start_ts is not None and cur_date < start_ts:
-            in_window = False
+        close_price = float(df.loc[i, 'close'])
+        open_price = float(df.loc[i, 'open'])
+        low_price = float(df.loc[i, 'low'])
+        cur_date = pd.Timestamp(df.loc[i, 'date'])
         if end_ts is not None and cur_date > end_ts:
-            in_window = False
+            break
+        in_window = ((start_ts is None or cur_date >= start_ts)
+                     and (end_ts is None or cur_date <= end_ts))
+        if not is_tradable_bar(open_price, df.loc[i, 'volume'] if 'volume' in df else 1):
+            if in_window:
+                equity_curve.append({'date': cur_date, 'equity': cash + position * close_price})
+            continue
 
-        # 【自适应】追踪止盈：浮盈后上移止损线（持仓中始终执行，含跨窗口持仓）
+        # 昨日收盘卖出信号在今日开盘执行。
+        if position > 0 and pending_sell is not None and cur_date > pending_sell['signal_date']:
+            (exec_price, net_sell, _, _), fill = execute_fill(
+                side="sell", signal_date=pending_sell['signal_date'], fill_date=cur_date,
+                fill_source="next_open", open_price=open_price, shares=position,
+                trade_cfg=trade_cfg, market_cap=estimate_market_cap(open_price),
+            )
+            pnl = net_sell - entry_cost
+            trades.append({
+                'entry': entry_price, 'exit': exec_price, 'pnl': pnl, 'type': 'signal',
+                'entry_date': df.loc[entry_idx, 'date'], 'exit_date': cur_date,
+                'signal_date': pending_sell['signal_date'], 'fill_date': cur_date,
+            })
+            fill_records.append(fill)
+            cash += net_sell
+            position = 0
+            pending_sell = None
+
+        # 昨日收盘买入信号在今日开盘执行；窗口外和末尾待成交订单不成交。
+        if position == 0 and pending_buy is not None and in_window and cur_date > pending_buy['signal_date']:
+            risk_per_share = pending_buy['risk_per_share']
+            max_shares = int(cash * base_risk * pending_buy['vol_reduce'] / risk_per_share)
+            max_shares = min(max_shares, int(cash * 0.5 * pending_buy['pos_factor'] / open_price))
+            shares = (max_shares // 100) * 100
+            if shares >= 100:
+                (exec_price, cost_total, _, _), fill = execute_fill(
+                    side="buy", signal_date=pending_buy['signal_date'], fill_date=cur_date,
+                    fill_source="next_open", open_price=open_price, shares=shares,
+                    trade_cfg=trade_cfg, market_cap=estimate_market_cap(open_price),
+                )
+                while shares >= 100 and cost_total > cash:
+                    shares -= 100
+                    if shares >= 100:
+                        (exec_price, cost_total, _, _), fill = execute_fill(
+                            side="buy", signal_date=pending_buy['signal_date'], fill_date=cur_date,
+                            fill_source="next_open", open_price=open_price, shares=shares,
+                            trade_cfg=trade_cfg, market_cap=estimate_market_cap(open_price),
+                        )
+                if shares >= 100:
+                    cash -= cost_total
+                    position = shares
+                    entry_price = exec_price
+                    entry_cost = cost_total
+                    entry_idx = i
+                    stop_loss = exec_price - risk_per_share
+                    stop_signal_date = pending_buy['signal_date']
+                    fill_records.append(fill)
+            pending_buy = None
+
+        # 已在前一时点确定的止损可在当日盘中触发；跳空穿越止损按开盘价成交。
         if position > 0:
-            pnl_check = (price - entry_price) / entry_price
-            trail_high_pct = trail_pct * 3
-            if pnl_check > trail_high_pct and i >= 3:
-                recent_low = df.iloc[i-3:i]['low'].min()
-                trail_stop = recent_low * 0.99
-                if trail_stop > stop_loss:
-                    stop_loss = trail_stop
+            raw_stop_fill = stop_fill_price(open_price, low_price, stop_loss)
+            if raw_stop_fill is not None:
+                source = 'gap_stop' if open_price <= stop_loss else 'intraday_stop'
+                (exec_price, net_sell, _, _), fill = execute_fill(
+                    side="sell", signal_date=stop_signal_date, fill_date=cur_date,
+                    fill_source=source, open_price=open_price, low_price=low_price,
+                    stop_price=stop_loss, shares=position, trade_cfg=trade_cfg,
+                    market_cap=estimate_market_cap(raw_stop_fill),
+                )
+                pnl = net_sell - entry_cost
+                trades.append({
+                    'entry': entry_price, 'exit': exec_price, 'pnl': pnl, 'type': 'stop',
+                    'entry_date': df.loc[entry_idx, 'date'], 'exit_date': cur_date,
+                    'signal_date': stop_signal_date, 'fill_date': cur_date,
+                })
+                fill_records.append(fill)
+                cash += net_sell
+                position = 0
+                pending_sell = None
+
+        # 收盘后更新明日可用的追踪止损并生成明日订单。
+        if position > 0:
+            pnl_check = (close_price - entry_price) / entry_price
+            next_stop = stop_loss
+            if pnl_check > trail_pct * 3 and i >= 3:
+                next_stop = max(next_stop, float(df.iloc[i-3:i + 1]['low'].min()) * 0.99)
             elif pnl_check > trail_pct and i >= 5:
-                recent_low = df.iloc[i-5:i]['low'].min()
-                trail_stop = recent_low * 0.98
-                if trail_stop > stop_loss:
-                    stop_loss = trail_stop
+                next_stop = max(next_stop, float(df.iloc[i-5:i + 1]['low'].min()) * 0.98)
+            if next_stop > stop_loss:
+                stop_loss = next_stop
+                stop_signal_date = cur_date
+            if sell_signals[i]:
+                pending_sell = {'signal_date': cur_date}
+        elif buy_signals[i] and in_window and (
+            allowed_entry_dates is None or cur_date in allowed_entry_dates
+        ):
+            atr_val = atr.iloc[i] if not pd.isna(atr.iloc[i]) else close_price * 0.03
+            if atr_val / close_price >= params.get('min_atr_pct', 0.015):
+                risk_per_share = atr_val * atr_mult * (stop_mult_base / 2.0)
+                if risk_per_share > 0:
+                    pos_factor = 0.5 if entry_scores[i] < score_thresh else (
+                        0.8 if entry_scores[i] < score_thresh + 1.0 else 1.0
+                    )
+                    atr_mean = atr.rolling(20).mean().iloc[i] if i >= 20 else atr_val
+                    vol_idx = atr_val / atr_mean if atr_mean and not pd.isna(atr_mean) else 1.0
+                    vol_reduce = 1.0 - vol_pos_f * min(1.0, max(0.0, (vol_idx - 0.8) / 0.7))
+                    pending_buy = {
+                        'signal_date': cur_date, 'risk_per_share': risk_per_share,
+                        'pos_factor': pos_factor, 'vol_reduce': vol_reduce,
+                    }
 
-        # 止损检查
-        if position > 0 and price < stop_loss:
-            sell_price = stop_loss
-            pnl = (sell_price - entry_price) * position
-            capital += pnl
-            trades.append({'entry': entry_price, 'exit': sell_price, 'pnl': pnl, 'type': 'stop',
-                           'entry_date': df.loc[entry_idx, 'date'], 'exit_date': cur_date})
-            position = 0
-
-        # 卖出信号
-        elif position > 0 and sell_signals[i]:
-            sell_price = price
-            pnl = (sell_price - entry_price) * position
-            capital += pnl
-            trades.append({'entry': entry_price, 'exit': sell_price, 'pnl': pnl, 'type': 'signal',
-                           'entry_date': df.loc[entry_idx, 'date'], 'exit_date': cur_date})
-            position = 0
-
-        # 买入信号：仅在统计窗口内开仓（窗口外保留指标预热，不交易）
-        elif position == 0 and buy_signals[i] and in_window:
-            atr_val = atr.iloc[i] if not pd.isna(atr.iloc[i]) else price * 0.03
-            # 【新增】波动率过滤：ATR占股价比过低跳过
-            _min_atr_pct_fb = params.get('min_atr_pct', 0.015)
-            if atr_val / price < _min_atr_pct_fb:
-                continue
-            risk_per_share = atr_val * atr_mult * (stop_mult_base / 2.0)  # 止损=ATR×倍数×状态基准
-            if risk_per_share <= 0:
-                continue
-            # 【自适应】信号置信度仓位调整
-            pos_factor = 1.0
-            if entry_scores[i] < score_thresh:
-                pos_factor = 0.5  # 边际信号半仓
-            elif entry_scores[i] < score_thresh + 1.0:
-                pos_factor = 0.8  # 中等信号八成仓
-            # 【扩展】使用base_risk_pct + vol_pos_factor动态仓位
-            vol_idx = atr_val / (atr.rolling(20).mean().iloc[i] if i >= 20 else atr_val)
-            vol_reduce = 1.0 - vol_pos_f * min(1.0, max(0.0, (vol_idx - 0.8) / 0.7))
-            max_shares = int(capital * base_risk * vol_reduce / risk_per_share)
-            if max_shares < 100:
-                max_shares = 100
-            max_shares = min(max_shares, int(capital * 0.5 * pos_factor / price))  # 最大仓位×置信度
-            if max_shares < 100:
-                continue
-            position = (max_shares // 100) * 100
-            if position < 100:
-                continue
-            entry_price = price
-            entry_idx = i
-            stop_loss = price - risk_per_share
-        
-        # 记录权益：仅窗口内日期参与绩效统计
         if in_window:
-            equity = capital + position * price
-            equity_curve.append({'date': cur_date, 'equity': equity})
+            equity_curve.append({'date': cur_date, 'equity': cash + position * close_price})
+
+    assert_causal_fills(fill_records)
 
     # 只统计入场日落在窗口内的交易（预热期不开仓，这里是双保险）
     def _trade_in_window(t):
@@ -2896,10 +2998,13 @@ def fast_backtest(df, params, initial_capital=500000, start_date=None, end_date=
     trades = [t for t in trades if _trade_in_window(t)]
 
     # === 4. 计算指标 ===
-    if not trades or not equity_curve:
+    if not equity_curve:
         return {
             'total_return': 0, 'max_drawdown': 0, 'sharpe': 0,
-            'trades': 0, 'win_rate': 0, 'profit_factor': 0
+            'trades': 0, 'win_rate': 0, 'profit_factor': 0,
+            'trade_records': [], 'fill_records': fill_records,
+            'equity_curve': [],
+            'unfilled_orders': int(pending_buy is not None) + int(pending_sell is not None),
         }
     
     eq_df = pd.DataFrame(equity_curve)
@@ -2935,7 +3040,11 @@ def fast_backtest(df, params, initial_capital=500000, start_date=None, end_date=
         'sharpe': round(sharpe, 3),
         'trades': len(trades),
         'win_rate': round(win_rate, 1),
-        'profit_factor': round(profit_factor, 2)
+        'profit_factor': round(profit_factor, 2),
+        'trade_records': trades,
+        'fill_records': fill_records,
+        'equity_curve': equity_curve,
+        'unfilled_orders': int(pending_buy is not None) + int(pending_sell is not None),
     }
 
 # ============ Walk-Forward 验证 ============
@@ -2952,12 +3061,14 @@ def walk_forward_split(df, train_pct=0.6, val_pct=0.2):
     return train, val, test
 
 # ============ 多股回测 ===⣿⣿⣿========
-def backtest_multi_stocks(codes, params, data_dict=None, start_date=None, end_date=None):
+def backtest_multi_stocks(codes, params, data_dict=None, start_date=None, end_date=None,
+                          entry_dates=None, universe_by_date=None):
     """对多只股票回测，返回聚合指标"""
     all_returns = []
     all_trades = 0
     all_drawdowns = []
     weighted_wins = 0.0
+    equity_series = []
 
     for code in codes:
         if data_dict and code in data_dict:
@@ -2973,35 +3084,55 @@ def backtest_multi_stocks(codes, params, data_dict=None, start_date=None, end_da
         if len(df) < 60:
             continue
 
-        result = fast_backtest(df, params, start_date=start_date, end_date=end_date)
-        if result is None or result['trades'] == 0:
+        code_entry_dates = entry_dates
+        if universe_by_date is not None:
+            source_dates = entry_dates if entry_dates is not None else df['date']
+            code_entry_dates = {
+                pd.Timestamp(d) for d in source_dates
+                if code in universe_by_date.get(str(pd.Timestamp(d))[:10], set())
+            }
+        result = fast_backtest(
+            df, params, start_date=start_date, end_date=end_date,
+            entry_dates=code_entry_dates,
+        )
+        if result is None:
             continue
 
         all_returns.append(result['total_return'])
         all_trades += result['trades']
         all_drawdowns.append(result['max_drawdown'])
         weighted_wins += result.get('win_rate', 0) * result['trades'] / 100.0
+        curve = result.get('equity_curve') or []
+        if curve:
+            series = pd.Series(
+                [float(row['equity']) for row in curve],
+                index=pd.to_datetime([row['date'] for row in curve]),
+            )
+            equity_series.append(series[~series.index.duplicated(keep='last')])
     
-    if not all_returns:
+    if not equity_series:
         return {'sharpe': -10, 'total_return': 0, 'trades': 0, 'max_drawdown': 0, 'win_rate': 0}
 
-    avg_return = np.mean(all_returns)
-    avg_drawdown = np.mean(all_drawdowns)
-    return_std = np.std(all_returns) if len(all_returns) > 1 else 1
-
-    sharpe = avg_return / return_std if return_std > 0 else 0
+    portfolio = pd.concat(equity_series, axis=1).sort_index().ffill().fillna(500000.0).sum(axis=1)
+    initial_equity = 500000.0 * len(equity_series)
+    total_return = (portfolio.iloc[-1] / initial_equity - 1) * 100 if len(portfolio) else 0.0
+    daily_returns = portfolio.pct_change().dropna()
+    sharpe = (daily_returns.mean() / daily_returns.std() * np.sqrt(250)
+              if len(daily_returns) > 20 and daily_returns.std() > 0 else 0.0)
+    drawdown = (portfolio / portfolio.cummax() - 1).min() * 100 if len(portfolio) else 0.0
 
     return {
         'sharpe': round(sharpe, 3),
-        'total_return': round(avg_return, 2),
+        'total_return': round(float(total_return), 2),
         'trades': all_trades,
-        'max_drawdown': round(avg_drawdown, 2),
+        'max_drawdown': round(float(drawdown), 2),
         'win_rate': round(weighted_wins / all_trades * 100, 1) if all_trades else 0,
         'n_stocks': len(all_returns)
     }
 
 # ============ Optuna 优化 ============
-def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=50):
+def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=50,
+                       calendar_dates=None, universe_by_date=None):
     """
     对单个市场状态优化参数
     state_dates: 该状态所有日期列表 ['2023-01-03', ...]
@@ -3013,17 +3144,30 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
     # 使用数据驱动的状态专属基准（替代全局BASELINE_PARAMS）
     bp = STATE_BASELINES.get(state_name, BASELINE_PARAMS)
 
-    # 按时间60/40分割为训练段和验证段
-    mid_idx = int(len(state_dates) * 0.6)
-    train_start = state_dates[0]
-    train_end = state_dates[mid_idx - 1]
-    val_start = state_dates[mid_idx]
-    val_end = state_dates[-1]
-    print(f"训练段: {train_start} ~ {train_end} ({mid_idx}天)")
-    print(f"验证段: {val_start} ~ {val_end} ({len(state_dates)-mid_idx}天)")
+    # 连续交易日切分，状态只限制入场；最后126日永不进入优化和普通验证。
+    calendar_dates = calendar_dates or sorted({
+        pd.Timestamp(d) for frame in data_dict.values() for d in frame['date']
+    })
+    try:
+        folds, sealed_dates = build_walk_forward_folds(calendar_dates)
+    except ValueError as exc:
+        print(f"严格walk-forward不可用：{exc}")
+        return {
+            'state': state_name, 'params': bp.copy(), 'status': 'research_only',
+            'reason': str(exc), 'train_sharpe': -10, 'val_sharpe': -10,
+            'val_return': 0, 'val_drawdown': 0, 'val_trades': 0,
+            'baseline_val_sharpe': 0, 'baseline_val_return': 0,
+            'baseline_val_drawdown': 0, 'baseline_val_trades': 0,
+            'baseline_val_win_rate': 0, 'val_win_rate': 0,
+            'fold_metrics': [], 'validation_protocol': 'wf-v2',
+            'sealed_period': None,
+        }
+    state_entry_dates = {pd.Timestamp(d) for d in state_dates}
+    print(f"严格walk-forward: {len(folds)}折；封存段: "
+          f"{sealed_dates[0]} ~ {sealed_dates[-1]} ({len(sealed_dates)}日)")
 
-    def objective(trial):
-        params = {
+    def suggest_params(trial):
+        return {
             'vol_ratio_high': trial.suggest_float('vol_ratio_high',
                 bp['vol_ratio_high'] * 0.7,
                 bp['vol_ratio_high'] * 1.3),
@@ -3086,61 +3230,87 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
             'vol_stack_threshold_small': trial.suggest_float('vol_stack_threshold_small', 6.0, 12.0),
         }
 
-        # 在训练时间段内回测
-        train_result = backtest_multi_stocks(all_codes, params, data_dict,
-                                              start_date=train_start, end_date=train_end)
-
-        if train_result is None or train_result['trades'] < 10:
-            return -10
-
-        penalty = 0
-        if train_result['max_drawdown'] < -25:
-            penalty = -2
-
-        return train_result['sharpe'] + penalty
-
     if not _HAS_OPTUNA:
         raise RuntimeError('optuna未安装，无法执行参数优化。请 pip install optuna')
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     start_time = time.time()
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    fold_metrics = []
+    best_params = bp.copy()
+    best_train_sharpe = -10.0
+    for fold_number, fold in enumerate(folds, 1):
+        train_entries = {d for d in state_entry_dates
+                         if fold.train_start <= d <= fold.train_end}
+
+        def objective(trial):
+            params = suggest_params(trial)
+            train = backtest_multi_stocks(
+                all_codes, params, data_dict,
+                start_date=fold.train_start, end_date=fold.train_end,
+                entry_dates=train_entries, universe_by_date=universe_by_date,
+            )
+            if not train or train.get('trades', 0) < 10:
+                return -10.0
+            penalty = -2 if train.get('max_drawdown', 0) < -25 else 0
+            return float(train.get('sharpe', -10)) + penalty
+
+        study = optuna.create_study(
+            direction='maximize', sampler=optuna.samplers.TPESampler(seed=42 + fold_number)
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        fold_params = study.best_params
+        best_params = fold_params
+        best_train_sharpe = float(study.best_value)
+        validation_entries = {d for d in state_entry_dates
+                              if fold.validation_start <= d <= fold.validation_end}
+        val = backtest_multi_stocks(
+            all_codes, fold_params, data_dict,
+            start_date=fold.validation_start, end_date=fold.validation_end,
+            entry_dates=validation_entries, universe_by_date=universe_by_date,
+        ) or {'sharpe': -10, 'total_return': 0, 'trades': 0, 'max_drawdown': 0, 'win_rate': 0}
+        baseline = backtest_multi_stocks(
+            all_codes, bp, data_dict,
+            start_date=fold.validation_start, end_date=fold.validation_end,
+            entry_dates=validation_entries, universe_by_date=universe_by_date,
+        ) or {'sharpe': -10, 'total_return': 0, 'trades': 0, 'max_drawdown': 0, 'win_rate': 0}
+        fold_metrics.append({
+            'fold': fold_number,
+            'train_start': str(fold.train_start)[:10], 'train_end': str(fold.train_end)[:10],
+            'val_start': str(fold.validation_start)[:10], 'val_end': str(fold.validation_end)[:10],
+            'train_sharpe': round(best_train_sharpe, 3),
+            'params': fold_params,
+            'sharpe': val['sharpe'], 'return': val['total_return'],
+            'drawdown': val['max_drawdown'], 'trades': val['trades'],
+            'win_rate': val.get('win_rate', 0),
+            'baseline_sharpe': baseline['sharpe'],
+            'baseline_return': baseline['total_return'],
+            'baseline_drawdown': baseline['max_drawdown'],
+            'baseline_trades': baseline['trades'],
+            'baseline_win_rate': baseline.get('win_rate', 0),
+            'excess_sharpe_positive': val['sharpe'] > baseline['sharpe'],
+        })
+
     elapsed = time.time() - start_time
+    print(f"逐折训练完成 ({elapsed:.0f}秒, {len(folds)}折×{n_trials}轮)")
 
-    best_params = study.best_params
-    best_train_sharpe = study.best_value
+    def _aggregate(rows, prefix=''):
+        trades = sum(int(r[f'{prefix}trades']) for r in rows)
+        wins = sum(float(r[f'{prefix}win_rate']) * int(r[f'{prefix}trades']) / 100 for r in rows)
+        return {
+            'sharpe': round(float(np.mean([r[f'{prefix}sharpe'] for r in rows])), 3),
+            'total_return': round(float(np.mean([r[f'{prefix}return'] for r in rows])), 2),
+            'max_drawdown': round(float(min(r[f'{prefix}drawdown'] for r in rows)), 2),
+            'trades': trades,
+            'win_rate': round(wins / trades * 100, 1) if trades else 0,
+        }
 
-    print(f"训练完成 ({elapsed:.0f}秒, {n_trials}轮)")
-    print(f"最佳训练夏普: {best_train_sharpe:.3f}")
-
-    # 验证集检验（不同时间段）
-    val_result = backtest_multi_stocks(all_codes, best_params, data_dict,
-                                        start_date=val_start, end_date=val_end)
-    if val_result is None:
-        val_result = {'sharpe': 0, 'total_return': 0, 'trades': 0, 'max_drawdown': 0}
-    print(f"验证集: 夏普={val_result['sharpe']}, 收益={val_result['total_return']}%, "
-          f"交易={val_result['trades']}, 回撤={val_result['max_drawdown']}%")
-
-    baseline_val = backtest_multi_stocks(all_codes, bp, data_dict,
-                                          start_date=val_start, end_date=val_end)
-    if baseline_val is None:
-        baseline_val = {'sharpe': 0, 'total_return': 0, 'trades': 0, 'max_drawdown': 0}
-    print(f"基准验证: 夏普={baseline_val['sharpe']}, 收益={baseline_val['total_return']}%, "
-          f"交易={baseline_val['trades']}, 回撤={baseline_val['max_drawdown']}%")
-
-    # 采纳判断：优化后夏普优于或接近基准
-    if baseline_val['sharpe'] <= 0:
-        # 基准为负，优化后为正则采纳，否则比较绝对值
-        improvement = 1.5 if val_result['sharpe'] > 0 else 0.0
-    else:
-        improvement = val_result['sharpe'] / baseline_val['sharpe']
-
-    if improvement >= 0.8:
-        status = 'adopted'
-        print(f"✅ 验证通过（夏普比值: {improvement:.2f}），采纳新参数")
-    else:
-        status = 'rejected'
+    val_result = _aggregate(fold_metrics)
+    baseline_val = _aggregate(fold_metrics, 'baseline_')
+    positive_folds = sum(bool(row['excess_sharpe_positive']) for row in fold_metrics)
+    required_positive = (len(fold_metrics) * 2 + 2) // 3
+    status = 'adopted' if positive_folds >= required_positive else 'rejected'
+    if status != 'adopted':
         best_params = bp.copy()
-        print(f"⚠️ 验证未通过（夏普比值: {improvement:.2f}），保留基准参数")
+    print(f"滚动验证: {positive_folds}/{len(fold_metrics)}折超额夏普为正；"
+          f"交易={val_result['trades']}；状态={status}")
 
     return {
         'state': state_name,
@@ -3157,8 +3327,16 @@ def optimize_for_state(state_name, all_codes, data_dict, state_dates, n_trials=5
         'baseline_val_win_rate': baseline_val.get('win_rate', 0),
         'val_win_rate': val_result.get('win_rate', 0),
         'status': status,
-        'train_period': f"{train_start}~{train_end}",
-        'val_period': f"{val_start}~{val_end}",
+        'train_period': f"{folds[0].train_start}~{folds[-1].train_end}",
+        'val_period': f"{folds[0].validation_start}~{folds[-1].validation_end}",
+        'fold_metrics': fold_metrics,
+        'positive_excess_folds': positive_folds,
+        'required_positive_folds': required_positive,
+        'validation_protocol': 'wf-v2',
+        'sealed_period': {
+            'start': str(sealed_dates[0])[:10], 'end': str(sealed_dates[-1])[:10],
+            'trading_days': len(sealed_dates), 'status': 'unread',
+        },
         'optimization_time': round(elapsed, 1)
     }
 
@@ -3181,8 +3359,15 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
     print("=" * 60)
 
     # 加载股票代码
+    from scripts.point_in_time_universe import load_universe
+    universe_by_date, universe_meta = load_universe()
     if stock_codes is None:
         all_codes = get_all_local_codes()
+        if universe_meta.get('complete'):
+            origin_day = next((day for day in sorted(universe_by_date)
+                               if day >= STRICT_EVALUATION_START), None)
+            if origin_day:
+                all_codes = sorted(universe_by_date[origin_day])
         if test_mode:
             stock_codes = all_codes[:20]
         else:
@@ -3198,12 +3383,9 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
 
     print(f"使用 {len(stock_codes)} 只股票进行优化")
 
-    # 预加载所有数据（过滤退市/停牌股：最新数据必须在30天内）
+    # 预加载数据；历史评估保留退市/停牌样本，禁止按当前新鲜度做幸存者过滤。
     print("预加载数据...")
-    from datetime import timedelta
-    cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=30)
     data_dict = {}
-    skipped_stale = 0
     for code in stock_codes:
         df = load_stock_data(code)
         # 本地parquet可能只有150根（每日扫描persist截断），回测需要更长历史；
@@ -3219,11 +3401,8 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             except Exception:
                 pass
         if df is not None and len(df) >= 120:
-            if df['date'].max() < cutoff_date:
-                skipped_stale += 1
-                continue
             data_dict[code] = df
-    print(f"成功加载 {len(data_dict)} 只股票数据" + (f" (跳过{skipped_stale}只过期数据)" if skipped_stale else ""))
+    print(f"成功加载 {len(data_dict)} 只股票数据（含历史退市/停牌缓存）")
 
     if len(data_dict) < 3:
         print("⚠️ 数据不足3只，无法优化")
@@ -3236,8 +3415,63 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
     max_data_date = max(df['date'].max() for df in data_dict.values()).strftime('%Y-%m-%d')
     print(f"股票数据范围: {min_data_date} ~ {max_data_date}")
 
-    # 加载市场状态
+    # 市场状态时间线定义实际可评估区间；指标预热可早于该区间。
     timeline = load_market_states()
+    evaluation_start = max(min_data_date, timeline[0]['date'], STRICT_EVALUATION_START)
+    evaluation_end = min(max_data_date, timeline[-1]['date'])
+
+    universe_date_complete = bool(
+        universe_meta.get('complete')
+        and universe_meta.get('start', '9999-99-99') <= evaluation_start
+        and universe_meta.get('end', '') >= evaluation_end
+    )
+    stock_data_coverage = 0.0
+    if universe_date_complete:
+        expected_bars = {}
+        for day, codes in universe_by_date.items():
+            if not (evaluation_start <= day <= evaluation_end):
+                continue
+            for code in codes:
+                expected_bars.setdefault(code, set()).add(day)
+        covered = 0
+        for code, expected_days in expected_bars.items():
+            frame = load_stock_data(code)
+            if frame is None or frame.empty:
+                continue
+            actual_days = set(pd.to_datetime(frame['date']).dt.strftime('%Y-%m-%d'))
+            if expected_days <= actual_days:
+                covered += 1
+        stock_data_coverage = covered / len(expected_bars) if expected_bars else 0.0
+        universe_meta.update({
+            'historical_stock_count': len(expected_bars),
+            'covered_stock_count': covered,
+            'stock_data_coverage': round(stock_data_coverage, 6),
+        })
+    if not universe_date_complete or stock_data_coverage < 1.0:
+        universe_meta = {
+            **universe_meta, 'complete': False,
+            'reason': 'historical universe or stock bars do not fully cover optimization data',
+        }
+        print("⚠️ 历史时点股票池不完整：结果仅供研究，禁止候选晋级")
+
+    calendar_dates = [pd.Timestamp(t['date']) for t in timeline
+                      if evaluation_start <= t['date'] <= evaluation_end]
+    try:
+        _, sealed_dates = build_walk_forward_folds(calendar_dates)
+        development_end = sealed_dates[0] - pd.Timedelta(days=1)
+    except ValueError:
+        development_end = pd.Timestamp(evaluation_start) - pd.Timedelta(days=1)
+    data_dict = {
+        code: frame[pd.to_datetime(frame['date']) <= development_end].copy()
+        for code, frame in data_dict.items()
+    }
+    snapshot_hash = hashlib.sha256()
+    for code in sorted(data_dict):
+        frame = data_dict[code]
+        columns = [c for c in ('date', 'open', 'high', 'low', 'close', 'volume') if c in frame]
+        snapshot_hash.update(code.encode('ascii'))
+        snapshot_hash.update(pd.util.hash_pandas_object(frame[columns], index=False).values.tobytes())
+    data_snapshot_hash = snapshot_hash.hexdigest()
 
     # 按状态分别优化（states允许调用方只优化子集，如每日轮换只跑2个状态）
     all_states = ['bull', 'bear', 'sideways', 'transition']
@@ -3256,6 +3490,8 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
         try:
             with open(partial_file, 'r') as f:
                 partial = json.load(f)
+            if partial.get('data_snapshot_hash') != data_snapshot_hash:
+                raise ValueError('断点数据快照已变化')
             results = partial.get('results', [])
             completed_states = {r['state'] for r in results}
             if completed_states:
@@ -3270,7 +3506,7 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             
         # 找到该状态对应的所有日期（只保留与股票数据重叠的日期）
         state_dates = [t['date'] for t in timeline
-                       if t['state'] == state and t['date'] >= min_data_date and t['date'] <= max_data_date]
+                       if t['state'] == state and evaluation_start <= t['date'] <= str(development_end)[:10]]
         if len(state_dates) < 30:
             print(f"\n{state} 状态仅{len(state_dates)}天，数据不足，跳过")
             continue
@@ -3280,7 +3516,9 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             all_codes_list,
             data_dict,
             state_dates,
-            n_trials=n_trials if not test_mode else 10
+            n_trials=n_trials if not test_mode else 10,
+            calendar_dates=calendar_dates,
+            universe_by_date=universe_by_date,
         )
         results.append(result)
         
@@ -3290,7 +3528,9 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
             'baseline_params': BASELINE_PARAMS,
             'results': results.copy(),
             'n_stocks': len(data_dict),
-            'n_trials': n_trials
+            'n_trials': n_trials,
+            'data_snapshot_hash': data_snapshot_hash,
+            'point_in_time_universe': universe_meta,
         }
         Path(partial_file).parent.mkdir(parents=True, exist_ok=True)
         with open(partial_file, 'w', encoding='utf-8') as f:
@@ -3303,7 +3543,11 @@ def run_optimization(stock_codes=None, n_trials=50, test_mode=False, n_stocks=20
         'baseline_params': BASELINE_PARAMS,
         'results': results,
         'n_stocks': len(data_dict),
-        'n_trials': n_trials
+        'n_trials': n_trials,
+        'stock_codes': all_codes_list,
+        'data_snapshot_hash': data_snapshot_hash,
+        'point_in_time_universe': universe_meta,
+        'validation_protocol': 'wf-v2',
     }
 
     final_output_path = output_path or PARAMS_FILE

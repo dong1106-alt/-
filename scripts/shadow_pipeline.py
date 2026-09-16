@@ -6,6 +6,7 @@
 扫描 -> 影子模拟交易 -> 影子巡检 -> 候选参数评估。
 """
 import datetime as dt
+import hashlib
 import json
 import os
 import shutil
@@ -15,10 +16,12 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTHON = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+_project_python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+PYTHON = _project_python if _project_python.exists() else Path(sys.executable)
 SHADOW_BASE = ROOT / "data" / "shadow"
 SHADOW = SHADOW_BASE
 MAIN_PORTFOLIO = ROOT / "data" / "sim_trades" / "portfolio.json"
+MAIN_POOL = ROOT / "data" / "all_main_board_codes.txt"
 
 
 def _date():
@@ -49,6 +52,7 @@ def _prepare(candidate_id):
     if not target.exists():
         if not MAIN_PORTFOLIO.exists():
             raise FileNotFoundError(f"主模拟盘不存在：{MAIN_PORTFOLIO}")
+        initial_hash = hashlib.sha256(MAIN_PORTFOLIO.read_bytes()).hexdigest()
         shutil.copy2(MAIN_PORTFOLIO, target)
         portfolio = json.loads(target.read_text(encoding="utf-8"))
         meta.write_text(json.dumps({
@@ -57,17 +61,12 @@ def _prepare(candidate_id):
             "baseline_position_count": len(portfolio.get("positions", [])),
             "candidate_id": candidate_id,
             "baseline_main_total_value": portfolio.get("total_value", 0),
+            "initial_portfolio_hash": initial_hash,
             "note": "从主模拟盘复制的只读起点；之后与主盘独立运行",
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[shadow] 已创建独立起点：{target}")
     elif not meta.exists():
-        portfolio = json.loads(target.read_text(encoding="utf-8"))
-        meta.write_text(json.dumps({
-            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "baseline_trade_count": len(portfolio.get("trade_history", [])),
-            "baseline_position_count": len(portfolio.get("positions", [])),
-            "note": "补建影子元数据；之后与主盘独立运行",
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        raise RuntimeError("existing shadow account has no verifiable starting metadata")
 
 
 def _run_step(name, script, env_extra, timeout):
@@ -108,35 +107,19 @@ def _run_step(name, script, env_extra, timeout):
         return "error"
 
 
-def main():
-    global SHADOW
-    if dt.date.today().weekday() >= 5:
-        print(f"[shadow] {_date()} 周末，跳过影子链路")
-        return 0
-    SHADOW, candidate_params, candidate_id = _select_shadow_run()
-    _prepare(candidate_id)
-    active_run = {
-        "candidate_id": candidate_id,
-        "run_dir": str(SHADOW.relative_to(ROOT)),
-        "candidate_params_file": str(candidate_params) if candidate_params else None,
-        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-    }
-    (SHADOW_BASE / "active_run.json").write_text(
-        json.dumps(active_run, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+def _scan_and_trade(candidate_params, prefix, stock_pool=None):
     signal_dir = SHADOW / "signals"
     sim_dir = SHADOW / "sim_trades"
     statuses = {}
     statuses["scan"] = _run_step(
-        "shadow_scan", "scripts/daily_signal_scan.py",
+        f"{prefix}_scan", "scripts/daily_signal_scan.py",
         {
             "SIGNAL_OUTPUT_DIR": str(signal_dir),
             "COMPANY_INVEST_GATE": "1",
+            **({"SHADOW_STOCK_POOL_FILE": str(stock_pool)} if stock_pool else {}),
             **({"OPTIMAL_PARAMS_FILE": str(candidate_params)} if candidate_params else {}),
         }, 3600,
     )
-    # 若重试时行情服务把当日标记为“非交易日”，但此前主扫描已生成当天
-    # v6 信号，则只复制这份只读结果到影子目录，继续完成影子模拟；绝不回写主盘。
     shadow_signal = signal_dir / "latest_signals.json"
     main_signal = ROOT / "reports" / "latest_signals.json"
     if not candidate_params and not shadow_signal.exists() and main_signal.exists():
@@ -144,16 +127,13 @@ def main():
             payload = json.loads(main_signal.read_text(encoding="utf-8"))
             if payload.get("scan_date") == _date():
                 shutil.copy2(main_signal, shadow_signal)
-                with (SHADOW / "logs" / f"shadow_scan_{_date()}.log").open("a", encoding="utf-8") as fh:
-                    fh.write("当日主扫描已有同版本 v6 结果；行情日判断重试未更新，影子使用只读副本。\n")
-                print("[shadow] 使用当日已有 v6 扫描结果副本继续影子模拟")
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"[shadow] 当日扫描副本不可用：{exc}")
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     if statuses["scan"] == "ok" and shadow_signal.exists():
         statuses["sim_trade"] = _run_step(
-            "shadow_sim_trade", "scripts/sim_trade_tracker.py",
+            f"{prefix}_sim_trade", "scripts/sim_trade_tracker.py",
             {
-                "SIM_SIGNALS_FILE": str(signal_dir / "latest_signals.json"),
+                "SIM_SIGNALS_FILE": str(shadow_signal),
                 "SIM_PORTFOLIO_DIR": str(sim_dir),
                 "SIM_SINGLE_STOCK_MAX_PCT": "25",
                 "SIM_MAX_STOP_PCT": "0.12",
@@ -163,11 +143,55 @@ def main():
         )
     else:
         statuses["sim_trade"] = "skipped"
+    return statuses
+
+
+def main():
+    global SHADOW
+    if dt.date.today().weekday() >= 5:
+        print(f"[shadow] {_date()} 周末，跳过影子链路")
+        return 0
+    SHADOW, candidate_params, candidate_id = _select_shadow_run()
+    _prepare(candidate_id)
+    candidate_shadow = SHADOW
+    paired_root = None
+    stock_pool = None
+    if candidate_params:
+        stock_pool = candidate_shadow / "stock_pool.txt"
+        if not stock_pool.exists():
+            if not MAIN_POOL.exists():
+                raise FileNotFoundError(f"stock pool missing: {MAIN_POOL}")
+            shutil.copy2(MAIN_POOL, stock_pool)
+        paired_root = SHADOW_BASE / "runs" / f"{candidate_id}__baseline"
+        SHADOW = paired_root
+        _prepare(f"{candidate_id}__baseline")
+        candidate_meta = json.loads((candidate_shadow / "shadow_meta.json").read_text(encoding="utf-8"))
+        baseline_meta = json.loads((paired_root / "shadow_meta.json").read_text(encoding="utf-8"))
+        if (not candidate_meta.get("initial_portfolio_hash")
+                or candidate_meta["initial_portfolio_hash"] != baseline_meta.get("initial_portfolio_hash")):
+            raise RuntimeError("paired shadow accounts have different starting portfolios")
+        SHADOW = candidate_shadow
+    active_run = {
+        "candidate_id": candidate_id,
+        "run_dir": str(SHADOW.relative_to(ROOT)),
+        "candidate_params_file": str(candidate_params) if candidate_params else None,
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    (SHADOW_BASE / "active_run.json").write_text(
+        json.dumps(active_run, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    statuses = _scan_and_trade(candidate_params, "shadow", stock_pool)
+    if candidate_params:
+        SHADOW = paired_root
+        paired = _scan_and_trade(None, "paired_baseline", stock_pool)
+        SHADOW = candidate_shadow
+        statuses.update({f"paired_{key}": value for key, value in paired.items()})
     statuses["patrol"] = _run_step(
         "shadow_patrol", "scripts/shadow_patrol.py", {}, 300,
     )
     statuses["evaluate"] = _run_step(
-        "shadow_evaluate", "scripts/shadow_evaluate.py", {}, 300,
+        "shadow_evaluate", "scripts/shadow_evaluate.py",
+        {"PAIRED_BASELINE_ROOT": str(paired_root)} if paired_root else {}, 300,
     )
     out = SHADOW / "evaluation" / f"chain_status_{_date()}.json"
     out.write_text(json.dumps({

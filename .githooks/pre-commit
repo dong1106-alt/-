@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+PYTHON_BIN="${SUPER_AGENT_PYTHON:-$(git config --get superagent.python || true)}"
+if [ -z "$PYTHON_BIN" ]; then
+  if [ -x ".venv/Scripts/python.exe" ]; then PYTHON_BIN=".venv/Scripts/python.exe"
+  elif [ -x ".venv/bin/python" ]; then PYTHON_BIN=".venv/bin/python"
+  else PYTHON_BIN="python"; fi
+fi
+"$PYTHON_BIN" scripts/quality_gate.py

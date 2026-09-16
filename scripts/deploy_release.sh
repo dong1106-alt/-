@@ -10,6 +10,13 @@ trap 'rm -rf "$STAGE"' EXIT
 
 unzip -q "$ARCHIVE" -d "$STAGE"
 python3 - <<PY
+import json
+from pathlib import Path
+p = Path("$STAGE/release_approval.json")
+if not p.exists() or json.loads(p.read_text(encoding="utf-8")).get("decision") != "release_approved":
+    raise SystemExit("sealed release approval missing or rejected")
+PY
+python3 - <<PY
 import compileall, sys
 if not compileall.compile_dir("$STAGE", quiet=1):
     raise SystemExit("release compile failed")

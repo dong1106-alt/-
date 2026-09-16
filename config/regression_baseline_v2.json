@@ -1,0 +1,16 @@
+{
+  "engine": "causal-v2",
+  "legacy_results_valid": false,
+  "fixture": "deterministic-wave-v1",
+  "metrics": {
+    "total_return": 5.1,
+    "max_drawdown": -2.08,
+    "sharpe": 1.341,
+    "trades": 4
+  },
+  "tolerance": {
+    "total_return": 0.05,
+    "max_drawdown": 0.05,
+    "sharpe": 0.01
+  }
+}

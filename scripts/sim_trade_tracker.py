@@ -14,6 +14,7 @@ import json
 import sys
 import os
 import time
+from datetime import datetime
 import requests
 from codeact_sdk import CodeActSDK
 from trading_rules import calc_trade_cost, load_trade_cost
@@ -1132,6 +1133,16 @@ def update_portfolio_stats(portfolio):
     # 即使当日未触发熔断，也保持 peak_equity 与 max_value 一致
     prev_peak = portfolio.get("peak_equity") or initial
     portfolio["peak_equity"] = round(max(prev_peak, total_value), 2)
+
+    # 影子候选与配对基准使用同一口径计算日收益和夏普。
+    history = portfolio.setdefault("equity_history", [])
+    day = str(portfolio.get("current_date") or portfolio.get("last_processed_date") or datetime.now().date())[:10]
+    point = {"date": day, "total_value": round(total_value, 2)}
+    if history and history[-1].get("date") == day:
+        history[-1] = point
+    else:
+        history.append(point)
+    portfolio["equity_history"] = history[-500:]
 
 
 # ===================== 主流程 =====================

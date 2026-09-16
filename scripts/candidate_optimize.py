@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import sys
@@ -44,6 +45,67 @@ def _load_core():
     return module
 
 
+def _hash_payload(payload) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _candidate_identity(output: dict) -> tuple[str, str]:
+    code_hash = hashlib.sha256()
+    for path in (
+        ROOT / "龟缠量化v6_optimized.py",
+        *(ROOT / "scripts" / name for name in (
+            "causal_backtest.py", "candidate_engine.py", "point_in_time_universe.py",
+            "daily_signal_scan.py", "sim_trade_tracker.py", "trading_rules.py",
+            "shadow_pipeline.py", "shadow_evaluate.py",
+        )),
+        ROOT / "data" / "causal_quality.py", ROOT / "config" / "settings.yaml",
+    ):
+        code_hash.update(path.read_bytes())
+    params = {r.get("state"): r.get("params") for r in output.get("results", [])}
+    signature = _hash_payload({
+        "code": code_hash.hexdigest(), "params": params,
+        "data": output.get("data_snapshot_hash"),
+        "universe": (output.get("point_in_time_universe") or {}).get("sha256"),
+    })
+    periods = {
+        r.get("state"): [(f.get("val_start"), f.get("val_end")) for f in r.get("fold_metrics", [])]
+        for r in output.get("results", [])
+    }
+    validation_key = _hash_payload({
+        "protocol": output.get("validation_protocol"), "periods": periods,
+    })
+    return signature, validation_key
+
+
+def _ledger_decision(output: dict) -> tuple[dict, bool]:
+    signature, validation_key = _candidate_identity(output)
+    ledger_path = CANDIDATES / "validation_ledger.json"
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        ledger = {"entries": {}}
+    previous = ledger["entries"].get(validation_key)
+    if previous:
+        if previous.get("candidate_signature") == signature:
+            return dict(previous["evaluation"]), True
+        return {
+            "decision": "rejected",
+            "reason": "该滚动验证区间已被其他候选消费，禁止重复试探",
+            "candidate_signature": signature,
+            "validation_key": validation_key,
+        }, True
+    evaluation = evaluate_backtest(output)
+    evaluation.update({"candidate_signature": signature, "validation_key": validation_key})
+    ledger["entries"][validation_key] = {
+        "candidate_signature": signature,
+        "evaluation": evaluation,
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    write_json(ledger_path, ledger)
+    return evaluation, False
+
+
 def main(argv: list[str]) -> int:
     today = dt.date.today()
     monthly = "--monthly" in argv
@@ -72,11 +134,11 @@ def main(argv: list[str]) -> int:
         states, keep_partial = None, False
         print(f"[candidate] {candidate_id}: {n_stocks}只股票 × {n_trials}轮，全状态样本外评估")
     else:
-        # 每日断点用固定文件名以支持跨天累积（路径必须在main内取，尊重测试对CANDIDATES的替换）
-        partial_path = CANDIDATES / "partial" / "daily_states.json"
+        # 每日只做研究，不跨日拼接不同数据快照，也不允许自动进入影子盘。
+        partial_path = CANDIDATES / "partial" / f"daily_{today:%Y%m%d}.json"
         states = DAILY_ROTATION[today.weekday() % 2]
-        keep_partial = True
-        print(f"[candidate] {candidate_id}: {n_stocks}只×{n_trials}轮，今日轮换状态{states}（跨天累积，单日约减半耗时）")
+        keep_partial = False
+        print(f"[candidate] {candidate_id}: {n_stocks}只×{n_trials}轮，今日轮换状态{states}（研究模式）")
 
     try:
         output = _load_core().run_optimization(
@@ -97,26 +159,17 @@ def main(argv: list[str]) -> int:
         return 1
 
     if not monthly:
-        done = {r.get("state") for r in output.get("results", [])}
-        missing = [s for s in REQUIRED_STATES if s not in done]
-        if missing:
-            # 尚未凑满必需状态：保留断点，明日轮换继续累积，不做评估
-            evaluation = {
-                "candidate_id": candidate_id,
-                "decision": "pending",
-                "reason": (f"跨天累积中：已完成 {'、'.join(sorted(done & set(ALL_STATES)))}，"
-                           f"待补齐 {'、'.join(missing)} 后评估"),
-                "completed_states": sorted(done & set(ALL_STATES)),
-            }
-            evaluation.update({"created_at": dt.datetime.now().isoformat(timespec="seconds"), "raw_path": str(raw_path)})
-            write_json(eval_path, evaluation)
-            print(f"[candidate] {evaluation['reason']}；断点保留：{partial_path}")
-            return 0
-        if partial_path.exists():
-            partial_path.unlink()
-            print(f"[candidate] 必需状态已凑齐，清理断点：{partial_path}")
+        evaluation = {
+            "candidate_id": candidate_id, "decision": "research_only",
+            "reason": "每日优化仅供研究；只有月度全状态候选可进入验证账本",
+            "completed_states": sorted(r.get("state") for r in output.get("results", [])),
+        }
+        evaluation.update({"created_at": dt.datetime.now().isoformat(timespec="seconds"), "raw_path": str(raw_path)})
+        write_json(eval_path, evaluation)
+        print(f"[candidate] {evaluation['reason']}")
+        return 0
 
-    evaluation = evaluate_backtest(output)
+    evaluation, reused = _ledger_decision(output)
     evaluation.update({"candidate_id": candidate_id, "created_at": dt.datetime.now().isoformat(timespec="seconds"), "raw_path": str(raw_path)})
     write_json(eval_path, evaluation)
 
@@ -124,7 +177,7 @@ def main(argv: list[str]) -> int:
         active = dict(output)
         active["candidate_meta"] = {"candidate_id": candidate_id, "evaluation": evaluation}
         write_json(CANDIDATES / "active_shadow.json", active)
-        print(f"[candidate] 通过预筛，下一交易日进入影子验证：{candidate_id}")
+        print(f"[candidate] {'复用既有验证结果；' if reused else ''}通过预筛，下一交易日进入影子验证：{candidate_id}")
     else:
         print(f"[candidate] 已拒绝：{evaluation['reason']}")
     return 0
