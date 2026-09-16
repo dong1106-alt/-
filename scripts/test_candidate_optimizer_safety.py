@@ -21,9 +21,9 @@ def row(state):
         "val_drawdown": -5, "baseline_val_drawdown": -6,
         "val_win_rate": 55, "baseline_val_win_rate": 50,
         "fold_metrics": [
-            {"excess_sharpe_positive": True, "val_start": "2024-01-01", "val_end": "2024-03-31"},
-            {"excess_sharpe_positive": True, "val_start": "2024-04-10", "val_end": "2024-06-30"},
-            {"excess_sharpe_positive": True, "val_start": "2024-07-10", "val_end": "2024-09-30"},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20, "val_start": "2024-01-01", "val_end": "2024-03-31"},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20, "val_start": "2024-04-10", "val_end": "2024-06-30"},
+            {"excess_sharpe_positive": True, "eligible": True, "validation_state_days": 20, "val_start": "2024-07-10", "val_end": "2024-09-30"},
         ],
     }
 
@@ -31,7 +31,7 @@ def row(state):
 class FakeCore:
     def run_optimization(self, *, output_path, **_):
         output = {
-            "validation_protocol": "wf-v2",
+            "validation_protocol": "wf-v3",
             "point_in_time_universe": {"complete": True},
             "data_snapshot_hash": "fixture",
             "results": [row("bull"), row("bear"), row("sideways")],
@@ -57,6 +57,9 @@ with tempfile.TemporaryDirectory(prefix="candidate_safety_") as tmp:
     assert runner.main(["--monthly"]) == 0
     assert (Path(tmp) / "active_shadow.json").exists()
     accepted = json.loads((Path(tmp) / "active_shadow.json").read_text(encoding="utf-8"))
+    _, key = runner._candidate_identity(accepted)
+    periods = [(f["val_start"], f["val_end"]) for f in accepted["results"][0]["fold_metrics"]]
+    assert key == runner._hash_payload({"protocol": "wf-v2", "periods": periods})
     repeated, reused = runner._ledger_decision(accepted)
     assert reused and repeated["decision"] == "shadow_ready"
     changed = json.loads(json.dumps(accepted))
@@ -64,10 +67,12 @@ with tempfile.TemporaryDirectory(prefix="candidate_safety_") as tmp:
     changed["results"][0]["params"] = {"marker": 2}
     rejected, reused = runner._ledger_decision(changed)
     assert reused and rejected["decision"] == "rejected"
-    partial = json.loads(json.dumps(changed))
-    partial["results"] = partial["results"][:2]
-    rejected, reused = runner._ledger_decision(partial)
+    overlapping = json.loads(json.dumps(changed))
+    for result in overlapping["results"]:
+        result["fold_metrics"] = result["fold_metrics"][:2]
+    rejected, reused = runner._ledger_decision(overlapping)
     assert reused and rejected["decision"] == "rejected"
+    assert "重叠" in rejected["reason"]
 after = hashlib.sha256(main_params.read_bytes()).hexdigest() if main_params.exists() else None
 assert before == after
 print("candidate_optimizer_main_params_unchanged_ok")
