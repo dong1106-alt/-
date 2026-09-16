@@ -12,4 +12,12 @@ NAMES = {
 for name in NAMES:
     wrapper = (ROOT / "codeact" / "scripts" / name).read_text(encoding="utf-8")
     assert 'TARGET = ROOT / "scripts" / Path(__file__).name' in wrapper, name
+
+registration = (ROOT / "scripts" / "register_scheduled_tasks.ps1").read_text(encoding="utf-8")
+mirrored_registration = (ROOT / "codeact" / "scripts" / "register_scheduled_tasks.ps1").read_text(encoding="utf-8")
+assert registration == mirrored_registration
+assert "-u scripts/run_once.py" in registration
+assert "-u run_once.py" not in registration
+root_runner = (ROOT / "run_once.py").read_text(encoding="utf-8")
+assert '"scripts" / "run_once.py"' in root_runner
 print("canonical_wrappers_ok")
