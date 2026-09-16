@@ -753,137 +753,14 @@ def calc_valuation_percentile(df: pd.DataFrame, lookback: int = 250) -> Dict[str
 
 # ===================== 整股预评分（含估值豁免） =====================
 def calc_stock_quality_score(df: pd.DataFrame, st_cfg: dict) -> float:
-    """
-    计算整只股票的综合趋势质量评分
-    【V5.3.4新增】估值极端低时给予豁免加分
-    """
-    if len(df) < 30:
-        return 0.0
-
-    recent = df.copy()
-    recent['trend_deviation'] = recent['close'] / recent['ma60'] - 1
-    recent['trend_stability'] = 1 - recent['trend_deviation'].rolling(20).std() * 10
-    recent['trend_stability'] = recent['trend_stability'].clip(0, 1)
-    recent['trend_strength_score'] = (recent['close'] / recent['ma60'] - 1).clip(-1, 1) * 0.5 + 0.5
-    recent['above_ma20_ratio'] = (recent['close'] > recent['ma20']).rolling(20).mean()
-
-    base_score = (
-        recent['trend_stability'].mean() * 0.30 +
-        recent['trend_strength_score'].mean() * 0.30 +
-        recent['above_ma20_ratio'].mean() * 0.20
-    ) * 100
-
-    # R²
-    closes = recent['close'].values
-    n_pts = len(closes)
-    x = np.arange(n_pts)
-    x_mean = x.mean()
-    y_mean = closes.mean()
-    ss_xy = np.sum((x - x_mean) * (closes - y_mean))
-    ss_xx = np.sum((x - x_mean) ** 2)
-    ss_yy = np.sum((closes - y_mean) ** 2)
-    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy) if ss_xx > 0 and ss_yy > 0 else 0
-
-    # 历史突破模拟
-    sim_trades = []
-    in_position = False
-    entry_price = 0
-    entry_idx = 0
-    exit_low_col = 'dc_low_10' if 'dc_low_10' in recent.columns else None
-    if exit_low_col is None and 'exit_low' in recent.columns:
-        exit_low_col = 'exit_low'
-    for i in range(20, len(recent)):
-        if not in_position:
-            if 'dc_high' in recent.columns and not pd.isna(recent['dc_high'].iloc[i]):
-                if recent['close'].iloc[i] > recent['dc_high'].iloc[i]:
-                    in_position = True
-                    entry_price = recent['close'].iloc[i]
-                    entry_idx = i
-        else:
-            should_exit = False
-            if exit_low_col and not pd.isna(recent[exit_low_col].iloc[i]):
-                if recent['close'].iloc[i] < recent[exit_low_col].iloc[i]:
-                    should_exit = True
-            if i - entry_idx >= 30:
-                should_exit = True
-            if should_exit:
-                exit_price = recent['close'].iloc[i]
-                pnl_pct = (exit_price / entry_price - 1) * 100
-                sim_trades.append(pnl_pct)
-                in_position = False
-
-    if len(sim_trades) > 0:
-        sim_win_rate = sum(1 for p in sim_trades if p > 0) / len(sim_trades)
-        sim_avg_pnl = np.mean(sim_trades)
-    else:
-        sim_win_rate = 0.5
-        sim_avg_pnl = 0
-
-    r2_score = r_squared * 100
-    sim_score = sim_win_rate * 70 + min(max(sim_avg_pnl * 3, 0), 30)
-
-    score = base_score * 0.5 + r2_score * 0.20 + sim_score * 0.30
-
-    if r_squared < 0.3:
-        score = min(score, 35.0)
-    if len(sim_trades) >= 3 and sim_win_rate <= 0.3:
-        score = min(score, 35.0)
-    if len(sim_trades) >= 3 and sim_avg_pnl < -1:
-        score = min(score, 35.0)
-
-    # 抄底先锋（X_7主力吸货强度）
-    x1 = recent['low'].shift(1)
-    abs_diff = (recent['low'] - x1).abs()
-    pos_diff = (recent['low'] - x1).clip(lower=0)
-    sma_abs = abs_diff.ewm(alpha=1/3, adjust=False).mean()
-    sma_pos = pos_diff.ewm(alpha=1/3, adjust=False).mean()
-    x2 = pd.Series(np.where(sma_pos > 1e-10, sma_abs / sma_pos * 100, 9999.0), index=recent.index)
-    x3 = (x2 * 10).ewm(alpha=2/4, adjust=False).mean()
-    x4 = recent['low'].rolling(38).min()
-    x5 = x3.rolling(38).max()
-    accum_raw = pd.Series(0.0, index=recent.index)
-    new_low_mask = recent['low'] <= x4
-    accum_raw[new_low_mask] = (x3[new_low_mask] + x5[new_low_mask] * 2) / 2
-    x7 = accum_raw.ewm(alpha=2/4, adjust=False).mean() / 618
-
-    dip_signal = x7 >= 1
-    dip_onset = dip_signal & ~dip_signal.shift(1, fill_value=False)
-
-    dip_count = 0
-    for i in range(len(recent)):
-        if dip_onset.iloc[i]:
-            future_after = recent.iloc[i + 1:min(i + 21, len(recent))]
-            if len(future_after) > 0 and (future_after['close'] > future_after['dc_high']).any():
-                dip_count += 1
-
-    dip_score = min(dip_count * 3.0, 15.0)
-    score += dip_score
-
-    # 【V5.3.4新增】估值极端低豁免加分
-    # 【修改】优先使用真实PE/PB分位（df中valuation_percentile列），无则回退到价格分位
-    if "valuation_percentile" in recent.columns:
-        val_pct = recent["valuation_percentile"].iloc[-1]
-        is_extreme = (val_pct is not None) and (not pd.isna(val_pct)) and (val_pct < 0.10)
-        val_label = f"PE/PB分位{val_pct:.1%}" if not pd.isna(val_pct) else "PE/PB分位N/A"
-    else:
-        valuation = calc_valuation_percentile(recent)
-        is_extreme = valuation['is_extreme']
-        val_label = f"价格分位{valuation['price_percentile']:.1%}"
-    if st_cfg.get('extreme_value_exemption', True) and is_extreme:
-        exemption_bonus = 15.0
-        score += exemption_bonus
-        print(f"   【估值豁免】{val_label} < 10%，额外+{exemption_bonus}分")
-
-    # 筹码集中度辅助
-    if 'ma5' not in recent.columns:
-        recent['ma5'] = recent['close'].rolling(5).mean()
-    deviation = abs(recent['close'] / recent['ma60'] - 1).mean()
-    if deviation < 0.05 and recent['ma5'].iloc[-1] > recent['ma20'].iloc[-1] > recent['ma60'].iloc[-1]:
-        score += 5
-
-    print(f"   [V5.3.4评分] 基础:{base_score:.1f} | R²:{r_squared:.3f} | 模拟{len(sim_trades)}笔胜率{sim_win_rate*100:.0f}% | 主力吸货信号{dip_count}(+{dip_score:.1f}) | 最终:{score:.1f}")
-    return round(score, 1)
-
+    """截至当日的因果预评分：无样本内模拟盈亏、不向后看突破。"""
+    from data.causal_quality import score_stock
+    score, detail = score_stock(df, st_cfg)
+    print(
+        f"   [评分] 基础:{detail.get('base_score', 0)} | R²:{detail.get('r_squared', 0)} "
+        f"| 吸货:{detail.get('dip_score', 0)} | 最终:{score}"
+    )
+    return score
 # ===================== 信号生成（含估值极端抄底） =====================
 # 【v5.3.4.1重构】gen_signal_enhanced 改为向量化计算，消除 for i in range(n) 逐行循环
 # 原代码两段 O(n)~O(n*look) 循环 → 全部用 pandas/numpy 向量运算，逻辑完全等价

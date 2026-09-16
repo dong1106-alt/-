@@ -5,6 +5,7 @@ __pycache__/
 
 # Local agent workspace
 .zcode/
+.mimosa/
 
 # Runtime state and market data; retain Python source under data/
 data/**

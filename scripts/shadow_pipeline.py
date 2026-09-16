@@ -131,6 +131,7 @@ def main():
         "shadow_scan", "scripts/daily_signal_scan.py",
         {
             "SIGNAL_OUTPUT_DIR": str(signal_dir),
+            "COMPANY_INVEST_GATE": "1",
             **({"OPTIMAL_PARAMS_FILE": str(candidate_params)} if candidate_params else {}),
         }, 3600,
     )

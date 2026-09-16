@@ -132,6 +132,47 @@ def json_list_summary(path, topn=5):
     return len(items), 0, names
 
 
+def company_gate_brief(signal_path, topn=5):
+    """影子信号里的公司门禁摘要；文件缺失或无该字段则返回 None。"""
+    try:
+        data = json.loads(Path(signal_path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    buys = data.get("buy_signals") or []
+    skips = data.get("company_gate_skips") or []
+    gated = ("company_gate_skips" in data) or any(
+        isinstance(it, dict) and it.get("company_gate") for it in list(buys) + list(skips)
+    )
+    if not gated:
+        return None
+    pass_bits = []
+    for it in buys[:topn]:
+        if not isinstance(it, dict):
+            continue
+        gate = it.get("company_gate") or {}
+        band = gate.get("expected_band") or {}
+        mid = band.get("mid")
+        name = it.get("name") or it.get("code") or ""
+        if mid is not None:
+            pass_bits.append(f"{name}中值{mid:.0%}")
+        else:
+            pass_bits.append(str(name))
+    skip_bits = []
+    for it in skips[:topn]:
+        if not isinstance(it, dict):
+            continue
+        gate = it.get("company_gate") or {}
+        name = it.get("name") or it.get("code") or ""
+        why = "、".join(gate.get("reasons") or [])[:40]
+        skip_bits.append(f"{name}({gate.get('decision', 'SKIP')}{('：' + why) if why else ''})")
+    return (
+        f"PASS {len(buys)} 条" + (f"：{'、'.join(pass_bits)}" if pass_bits else "")
+        + f"；拦截 {len(skips)} 条" + (f"：{'、'.join(skip_bits)}" if skip_bits else "")
+    )
+
+
 def active_shadow_run():
     """返回当前影子运行目录及候选标识；无指针时兼容旧v6影子目录。"""
     base = ROOT / "data" / "shadow"
@@ -258,6 +299,9 @@ def main():
             lines.append(f"- 扫描：已运行，买入 {buy_cnt} 条、卖出 {sell_cnt} 条" + (f"，Top{len(top)}：{'、'.join(top)}" if top else ""))
         else:
             lines.append("- 扫描：已运行，信号明细缺失")
+        gate_line = company_gate_brief(shadow_signal) if shadow_signal.exists() else None
+        if gate_line:
+            lines.append(f"- 公司门禁：{gate_line}")
     elif shadow_status["shadow_scan"] in {"error", "timeout"}:
         lines.append("- 扫描：运行异常/超时，见影子日志")
     else:
