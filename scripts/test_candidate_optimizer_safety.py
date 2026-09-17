@@ -52,6 +52,7 @@ main_params = ROOT / "data" / "optimal_params.json"
 before = hashlib.sha256(main_params.read_bytes()).hexdigest() if main_params.exists() else None
 with tempfile.TemporaryDirectory(prefix="candidate_safety_") as tmp:
     runner.CANDIDATES = Path(tmp)
+    runner.LEDGER_PATH = Path(tmp) / "validation_ledger.json"
     runner._load_core = lambda: FakeCore()
     runner.dt.date = Monday
     assert runner.main(["--monthly"]) == 0
@@ -73,6 +74,18 @@ with tempfile.TemporaryDirectory(prefix="candidate_safety_") as tmp:
     rejected, reused = runner._ledger_decision(overlapping)
     assert reused and rejected["decision"] == "rejected"
     assert "重叠" in rejected["reason"]
+    reserved_periods = [("2021-01-01", "2021-03-31"),
+                        ("2021-04-10", "2021-06-30"),
+                        ("2021-07-10", "2021-09-30")]
+    reservation = runner.reserve_validation_periods("historical-fixture", reserved_periods, "profile")
+    assert reservation["status"] == "reserved"
+    reserved = json.loads(runner.LEDGER_PATH.read_text(encoding="utf-8"))
+    assert reserved["reservations"]["historical-fixture"]["validation_periods"] == [list(p) for p in reserved_periods]
+    try:
+        runner.reserve_validation_periods("changed-fixture", [("2021-02-01", "2021-04-30")], "changed")
+        raise AssertionError("overlapping reservation was accepted")
+    except RuntimeError:
+        pass
 after = hashlib.sha256(main_params.read_bytes()).hexdigest() if main_params.exists() else None
 assert before == after
 print("candidate_optimizer_main_params_unchanged_ok")

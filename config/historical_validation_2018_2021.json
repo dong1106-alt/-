@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "profile_id": "historical-2018-2021-v1",
+  "candidate_id": "candidate-historical-2018-2021-v1",
+  "data_start": "2017-06-01",
+  "evaluation_start": "2018-01-01",
+  "evaluation_end": "2021-12-31",
+  "sealed_start": "2021-06-30",
+  "sealed_end": "2021-12-31",
+  "n_stocks": 50,
+  "n_trials": 50,
+  "validation_protocol": "wf-v3",
+  "validation_periods": [
+    ["2019-02-19", "2019-05-22"],
+    ["2019-05-30", "2019-08-27"],
+    ["2019-09-04", "2019-12-09"],
+    ["2019-12-17", "2020-03-23"],
+    ["2020-03-31", "2020-07-03"],
+    ["2020-07-13", "2020-10-15"],
+    ["2020-10-23", "2021-01-20"],
+    ["2021-01-28", "2021-05-07"]
+  ],
+  "required_eligible_folds": {
+    "bull": 7,
+    "bear": 5,
+    "sideways": 8
+  },
+  "independence_basis": "No current project artifact or validation ledger records strategy evaluation before 2024; absolute prior human knowledge cannot be proven."
+}
