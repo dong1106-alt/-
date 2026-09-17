@@ -203,6 +203,49 @@ def candidate_brief(ds):
     return "今日未生成候选或数据不足"
 
 
+def switch_ready_notice():
+    """Return a one-time switch notice only after the sealed gate approves."""
+    base = DATA / "candidates"
+    try:
+        recommendation = json.loads((base / "promotion_recommendation.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    signature = recommendation.get("candidate_signature")
+    candidate_id = recommendation.get("candidate_id")
+    if not signature or not recommendation.get("paired_baseline", {}).get("passed"):
+        return None
+    approvals = sorted(base.glob("release_gate_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    approval = None
+    for path in approvals:
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if item.get("decision") == "release_approved" and item.get("candidate_signature") == signature:
+            approval = item
+            break
+    if approval is None:
+        return None
+    marker_path = base / "release_notification.json"
+    try:
+        if json.loads(marker_path.read_text(encoding="utf-8")).get("candidate_signature") == signature:
+            return None
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    candidate_metrics = approval.get("candidate_metrics", {})
+    baseline_metrics = approval.get("baseline_metrics", {})
+    body = (
+        f"候选策略：{candidate_id}\n"
+        "严格样本外验证、配对影子和封存测试均已通过。\n"
+        "当前可以申请切换策略，但系统不会自动部署；请确认后再执行发布。\n"
+        f"候选夏普：{candidate_metrics.get('sharpe', '未知')}\n"
+        f"基准夏普：{baseline_metrics.get('sharpe', '未知')}\n"
+        f"候选回撤：{candidate_metrics.get('drawdown', '未知')}%\n"
+        f"候选签名：{signature}"
+    )
+    return marker_path, signature, body
+
+
 def main():
     today = datetime.date.today()
     ds = today.strftime("%Y-%m-%d")
@@ -342,6 +385,14 @@ def main():
     print(desp)
     print("=" * 60)
     wechat_push(title, desp)
+    notice = switch_ready_notice()
+    if notice:
+        marker_path, signature, body = notice
+        if wechat_push("策略可切换，等待批准", body):
+            marker_path.write_text(
+                json.dumps({"candidate_signature": signature, "sent_at": ds}, ensure_ascii=False),
+                encoding="utf-8",
+            )
     return 0
 
 

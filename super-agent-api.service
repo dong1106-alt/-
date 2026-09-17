@@ -8,6 +8,7 @@ User=superagent
 Group=superagent
 WorkingDirectory=/opt/super-agent/current
 EnvironmentFile=-/etc/super-agent/super-agent.env
+Environment=SUPER_AGENT_RUNTIME_GUARD=1
 ExecStart=/opt/super-agent/current/.venv/bin/python -u /opt/super-agent/current/api_service/server.py
 Restart=on-failure
 RestartSec=5

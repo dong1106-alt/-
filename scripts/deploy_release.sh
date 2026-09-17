@@ -13,7 +13,7 @@ python3 - <<PY
 import json
 from pathlib import Path
 p = Path("$STAGE/release_approval.json")
-if not p.exists() or json.loads(p.read_text(encoding="utf-8")).get("decision") != "release_approved":
+if not p.exists() or json.loads(p.read_text(encoding="utf-8")).get("decision") not in {"release_approved", "protection_approved"}:
     raise SystemExit("sealed release approval missing or rejected")
 PY
 python3 - <<PY
@@ -29,6 +29,10 @@ for d in data logs reports .venv; do
   sudo ln -sfn "$BASE/$d" "$RELEASE/$d"
 done
 sudo chown -R superagent:superagent "$RELEASE"
+sudo "$BASE/.venv/bin/python" "$RELEASE/scripts/write_runtime_manifest.py" \
+  --root "$RELEASE" --params "$BASE/data/optimal_params.json"
+sudo install -m 644 "$RELEASE/super-agent-api.service" /etc/systemd/system/super-agent-api.service
+sudo install -m 644 "$RELEASE/super-agent-scheduler.service" /etc/systemd/system/super-agent-scheduler.service
 sudo ln -sfn "$RELEASE" "$BASE/current.next"
 sudo mv -Tf "$BASE/current.next" "$BASE/current"
 sudo systemctl daemon-reload

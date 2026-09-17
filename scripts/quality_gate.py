@@ -24,6 +24,8 @@ FAST = [
     ["scripts/test_shadow_package.py"],
     ["scripts/test_company_invest_gate.py"],
     ["scripts/test_canonical_wrappers.py"],
+    ["scripts/test_runtime_guard.py"],
+    ["scripts/test_switch_ready_notice.py"],
 ]
 
 FULL = FAST + [

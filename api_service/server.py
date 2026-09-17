@@ -25,6 +25,7 @@ import threading
 import datetime
 import re
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import io
@@ -40,6 +41,9 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import guichan_v6_stock_signal_analysis as g       # 导入分析模块（不会执行 main）
+from runtime_guard import verify_if_enabled
+
+verify_if_enabled(Path(ROOT))
 
 HOST = os.environ.get("GUICHAN_API_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GUICHAN_API_PORT", "8000"))
