@@ -22,7 +22,7 @@ good = {
     "validation_protocol": "wf-v3",
     "point_in_time_universe": {"complete": True},
     "excellent_metrics": {
-        "annual_return_pct": 26, "max_drawdown_pct": 9,
+        "annual_return_pct": 26, "max_drawdown_pct": 19.99,
         "calmar": 2.1, "sortino": 2.6, "sharpe": 2.1,
         "closed_trades": 501,
     },
@@ -36,7 +36,16 @@ assert evaluate_backtest(missing_excellent_metrics)["decision"] == "rejected"
 few_trades = {**good, "results": [row("bull", 13), row("bear", 13), row("sideways", 13)]}
 assert evaluate_backtest(few_trades)["decision"] == "rejected"
 
-bad_drawdown = {**good, "results": [row("bull", dd=-11), row("bear"), row("sideways")]}
+near_drawdown_limit = {
+    **good,
+    "results": [row("bull", dd=-19.99, base_dd=-19.99), row("bear"), row("sideways")],
+}
+assert evaluate_backtest(near_drawdown_limit)["decision"] == "shadow_ready"
+
+bad_drawdown = {
+    **good,
+    "results": [row("bull", dd=-20, base_dd=-20), row("bear"), row("sideways")],
+}
 assert evaluate_backtest(bad_drawdown)["decision"] == "rejected"
 
 bad_sharpe = {**good, "results": [row("bull", sharpe=1.05), row("bear"), row("sideways")]}

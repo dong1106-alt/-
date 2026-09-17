@@ -82,8 +82,8 @@ def compare_pair(candidate: dict, baseline: dict, candidate_start_count: int,
         failures.append("候选收益低于配对基准")
     if not _sharpe_pass(candidate_sharpe, baseline_sharpe):
         failures.append("候选夏普未较配对基准提升10%")
-    if candidate_dd > MAX_DRAWDOWN_PCT:
-        failures.append(f"候选回撤{candidate_dd:.2f}%超过{MAX_DRAWDOWN_PCT:.0f}%")
+    if candidate_dd >= MAX_DRAWDOWN_PCT:
+        failures.append(f"候选回撤{candidate_dd:.2f}%未低于{MAX_DRAWDOWN_PCT:.0f}%")
     if candidate_dd > baseline_dd:
         failures.append("候选回撤劣于配对基准")
     failures.extend(excellent_failures(excellent_metrics, require_deviation=True))

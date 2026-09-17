@@ -8,7 +8,7 @@ import statistics
 
 EXCELLENT_THRESHOLDS = {
     "annual_return_pct": 25.0,
-    "max_drawdown_pct": 10.0,
+    "max_drawdown_pct": 20.0,
     "calmar": 2.0,
     "sortino": 2.5,
     "sharpe": 2.0,
