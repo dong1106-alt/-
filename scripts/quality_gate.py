@@ -35,6 +35,7 @@ FULL = FAST + [
     ["scripts/test_research_factor_ic.py"],
     ["scripts/test_research_cloud_factor_overlay.py"],
     ["scripts/test_research_topk_dropout.py"],
+    ["scripts/test_research_v61c_low_turnover.py"],
     ["scripts/test_shadow_pairing.py"],
     ["scripts/test_sim_risk_smoke.py"],
     ["scripts/regression_test.py"],
