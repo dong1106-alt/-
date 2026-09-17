@@ -38,37 +38,50 @@ def ignored(path: Path) -> bool:
 
 
 def main() -> int:
+    protection = "--protection" in sys.argv[1:]
     gate = subprocess.run([sys.executable, str(ROOT / "scripts" / "quality_gate.py"), "--full"], cwd=ROOT)
     if gate.returncode:
         raise SystemExit("quality gate failed; release blocked")
-    active_path = ROOT / "data" / "candidates" / "active_shadow.json"
-    if not active_path.exists():
-        raise SystemExit("sealed release approval missing; release blocked")
-    active = json.loads(active_path.read_text(encoding="utf-8"))
-    active_signature = active.get("candidate_meta", {}).get("evaluation", {}).get("candidate_signature")
-    if not active_signature or _candidate_identity(active)[0] != active_signature:
-        raise SystemExit("candidate code or parameters changed; release blocked")
-    universe, universe_meta = load_universe()
-    if (not universe_meta.get("complete") or
-            (active.get("point_in_time_universe") or {}).get("sha256") != universe_meta.get("sha256")):
-        raise SystemExit("historical universe changed or incomplete; release blocked")
-    active_universe = active.get("point_in_time_universe") or {}
-    history_meta = load_history_manifest(
-        universe_meta.get("start", ""), universe_meta.get("end", ""), universe_meta.get("sha256", ""),
-        universe_by_date=universe,
-    )
-    if (not history_meta.get("complete")
-            or active_universe.get("stock_history_manifest_sha256") != history_meta.get("manifest_sha256")):
-        raise SystemExit("stock history manifest changed or incomplete; release blocked")
-    approval_path = ROOT / "data" / "candidates" / f"release_gate_{active_signature[:12]}.json"
-    if not approval_path.exists():
-        raise SystemExit("sealed release approval missing; release blocked")
-    approval = json.loads(approval_path.read_text(encoding="utf-8"))
-    if approval.get("decision") != "release_approved" or approval.get("candidate_signature") != active_signature:
-        raise SystemExit("release approval does not match active candidate")
-    version = sys.argv[1] if len(sys.argv) > 1 else datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    if protection:
+        params_path = ROOT / "data" / "optimal_params.json"
+        approval = {
+            "decision": "protection_approved",
+            "release_kind": "existing_strategy_protection",
+            "main_params_sha256": hashlib.sha256(params_path.read_bytes()).hexdigest(),
+            "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    else:
+        active_path = ROOT / "data" / "candidates" / "active_shadow.json"
+        if not active_path.exists():
+            raise SystemExit("sealed release approval missing; release blocked")
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+        active_signature = active.get("candidate_meta", {}).get("evaluation", {}).get("candidate_signature")
+        if not active_signature or _candidate_identity(active)[0] != active_signature:
+            raise SystemExit("candidate code or parameters changed; release blocked")
+        universe, universe_meta = load_universe()
+        if (not universe_meta.get("complete") or
+                (active.get("point_in_time_universe") or {}).get("sha256") != universe_meta.get("sha256")):
+            raise SystemExit("historical universe changed or incomplete; release blocked")
+        active_universe = active.get("point_in_time_universe") or {}
+        history_meta = load_history_manifest(
+            universe_meta.get("start", ""), universe_meta.get("end", ""), universe_meta.get("sha256", ""),
+            universe_by_date=universe,
+        )
+        if (not history_meta.get("complete")
+                or active_universe.get("stock_history_manifest_sha256") != history_meta.get("manifest_sha256")):
+            raise SystemExit("stock history manifest changed or incomplete; release blocked")
+        approval_path = ROOT / "data" / "candidates" / f"release_gate_{active_signature[:12]}.json"
+        if not approval_path.exists():
+            raise SystemExit("sealed release approval missing; release blocked")
+        approval = json.loads(approval_path.read_text(encoding="utf-8"))
+        if approval.get("decision") != "release_approved" or approval.get("candidate_signature") != active_signature:
+            raise SystemExit("release approval does not match active candidate")
+    args = [arg for arg in sys.argv[1:] if arg != "--protection"]
+    version = args[0] if args else datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     OUT.mkdir(exist_ok=True)
-    archive = OUT / f"super-agent-{version}.zip"
+    prefix = "super-agent-protected" if protection else "super-agent"
+    archive = OUT / f"{prefix}-{version}.zip"
     files = []
     for p in ROOT.rglob("*"):
         if not p.is_file() or ignored(p):

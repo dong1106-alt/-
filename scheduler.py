@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from task_state import TaskState, scheduler_lock
 from wechat_push import alert_task_failure
+from runtime_guard import verify_if_enabled
 
 if os.name == "nt":
     PY = ROOT / ".venv" / "Scripts" / "python.exe"
@@ -21,6 +22,7 @@ LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 STATE = TaskState(ROOT / "data" / "task_state.sqlite3")
 LOCK_PATH = ROOT / "data" / ".scheduler.lock"
+verify_if_enabled(ROOT)
 
 TASKS = [
     {"name": "daily_signal_scan", "time": "15:00", "script": "scripts/daily_signal_scan.py", "timeout": 3600, "monthly_only": False, "max_attempts": 3},
