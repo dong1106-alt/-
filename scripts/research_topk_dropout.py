@@ -23,7 +23,7 @@ ML_FEATURES = (
 )
 
 
-def _features(frame: pd.DataFrame) -> pd.DataFrame:
+def _features(frame: pd.DataFrame, forward_horizon: int = 5) -> pd.DataFrame:
     close = frame["close"]
     daily = close.pct_change()
     output = pd.DataFrame(index=frame.index)
@@ -46,15 +46,17 @@ def _features(frame: pd.DataFrame) -> pd.DataFrame:
     output["price_volume_corr20"] = close.rolling(20).corr(frame["volume"].clip(lower=1).apply(math.log))
     output["price_volume_corr60"] = close.rolling(60).corr(frame["volume"].clip(lower=1).apply(math.log))
     # Supervised research label: next open through the sixth open; never a signal feature.
+    if forward_horizon < 1:
+        raise ValueError("forward_horizon must be positive")
     future5 = pd.Series(float("nan"), index=frame.index)
     opens = frame["open"].to_numpy()
-    future5.iloc[:-6] = opens[6:] / opens[1:-5] - 1
+    future5.iloc[:-(forward_horizon + 1)] = opens[forward_horizon + 1:] / opens[1:-forward_horizon] - 1
     output["future5"] = future5
     return output
 
 
 def _load_bars(stock_dir: Path, codes: list[str], start: str, end: str,
-               history_start: str | None = None) -> dict[str, pd.DataFrame]:
+               history_start: str | None = None, forward_horizon: int = 5) -> dict[str, pd.DataFrame]:
     bars = {}
     start_ts = pd.Timestamp(history_start) if history_start else pd.Timestamp(start) - pd.Timedelta(days=240)
     end_ts = pd.Timestamp(end)
@@ -72,7 +74,7 @@ def _load_bars(stock_dir: Path, codes: list[str], start: str, end: str,
         frame = frame[(frame["date"] >= start_ts) & (frame["date"] <= end_ts)].sort_values("date")
         if len(frame) < 130:
             continue
-        for column, values in _features(frame).items():
+        for column, values in _features(frame, forward_horizon).items():
             frame[column] = values
         # Tencent/BaoStock daily volume is in board lots (100 shares).
         frame["avg_value20"] = (frame["close"] * frame["volume"] * 100).rolling(20).mean()
@@ -82,7 +84,8 @@ def _load_bars(stock_dir: Path, codes: list[str], start: str, end: str,
     return bars
 
 
-def _fit_lightgbm(bars: dict[str, pd.DataFrame], train_end: str, valid_end: str) -> dict:
+def _fit_lightgbm(bars: dict[str, pd.DataFrame], train_end: str, valid_end: str,
+                  forward_horizon: int) -> dict:
     try:
         import lightgbm as lgb
     except ImportError as exc:
@@ -152,7 +155,8 @@ def _tradable(row, previous_close: float, side: str) -> bool:
 def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         rebalance_days: int, market_ma: int, circuit_drawdown_pct: float,
         model_name: str = "linear", train_end: str = "2023-12-20",
-        valid_end: str = "2024-12-20", require_stock_uptrend: bool = False) -> dict:
+        valid_end: str = "2024-12-20", require_stock_uptrend: bool = False,
+        forward_horizon: int = 5) -> dict:
     universe, universe_meta = load_universe()
     days = [pd.Timestamp(day) for day in sorted(universe) if start <= day <= end]
     if not universe_meta.get("complete") or len(days) < 120:
@@ -165,11 +169,17 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
     if max_stocks and len(codes) > max_stocks:
         codes = sorted(codes, key=lambda code: hashlib.sha256(code.encode("ascii")).digest())[:max_stocks]
     history_start = "2022-01-01" if model_name == "lightgbm" else None
-    bars = _load_bars(ROOT / "data" / "stocks", codes, start, end, history_start=history_start)
+    bars = _load_bars(
+        ROOT / "data" / "stocks", codes, start, end,
+        history_start=history_start, forward_horizon=forward_horizon,
+    )
     if len(bars) < topk * 3:
         raise RuntimeError("too few complete stock histories")
 
-    model_meta = _fit_lightgbm(bars, train_end, valid_end) if model_name == "lightgbm" else None
+    model_meta = (
+        _fit_lightgbm(bars, train_end, valid_end, forward_horizon)
+        if model_name == "lightgbm" else None
+    )
     index = pd.read_parquet(ROOT / "data" / "index" / "sh000001.parquet")
     index["date"] = pd.to_datetime(index["date"])
     index = index.sort_values("date").set_index("date")
@@ -310,6 +320,7 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
             "market_ma": market_ma, "circuit_drawdown_pct": circuit_drawdown_pct,
             "sampled_stocks": len(bars), "model": model_name,
             "require_stock_uptrend": require_stock_uptrend,
+            "forward_horizon": forward_horizon,
         },
         "model_validation": model_meta,
         "metrics": metrics,
@@ -338,6 +349,7 @@ def main() -> int:
     parser.add_argument("--train-end", default="2023-12-20")
     parser.add_argument("--valid-end", default="2024-12-20")
     parser.add_argument("--require-stock-uptrend", action="store_true")
+    parser.add_argument("--forward-horizon", type=int, default=5)
     parser.add_argument("--output", type=Path, default=ROOT / "data" / "research_results" / "topk_dropout.json")
     args = parser.parse_args()
     result = run(
@@ -346,6 +358,7 @@ def main() -> int:
         circuit_drawdown_pct=args.circuit_drawdown_pct, model_name=args.model,
         train_end=args.train_end, valid_end=args.valid_end,
         require_stock_uptrend=args.require_stock_uptrend,
+        forward_horizon=args.forward_horizon,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
