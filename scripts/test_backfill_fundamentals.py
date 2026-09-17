@@ -16,7 +16,7 @@ performance = _normalize_performance([{
     "SECURITY_CODE": "600519", "SECUCODE": "600519.SH",
     "REPORTDATE": "2017-12-31", "NOTICE_DATE": "2018-03-28",
     "UPDATE_DATE": "2019-03-29", "BASIC_EPS": 21.56,
-    "PARENTNETPROFIT": 27000000000, "WEIGHTAVG_ROE": 32.95,
+    "PARENT_NETPROFIT": 27000000000, "WEIGHTAVG_ROE": 32.95,
     "SJLTZ": 61.58, "BPS": 90.0, "MGJYXJJE": 20.0,
 }], allowed)
 balance = _normalize_balance([{
@@ -29,6 +29,7 @@ row = frame.iloc[0]
 assert row["performance_available_date"] == pd.Timestamp("2019-03-29")
 assert row["available_date"] == pd.Timestamp("2019-04-01")
 assert abs(row["roe"] - 0.3295) < 1e-12
+assert row["net_profit"] == 27000000000
 assert abs(row["profit_yoy"] - 0.6158) < 1e-12
 assert abs(row["debt_ratio"] - 0.2867) < 1e-12
 assert bool(row["complete_factors"])
