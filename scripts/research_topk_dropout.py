@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from point_in_time_universe import load_universe
 from trading_rules import calc_trade_cost, load_trade_cost
 
 ROOT = Path(__file__).resolve().parent.parent
+DATA_ROOT = Path(os.environ.get("SUPER_AGENT_DATA_ROOT", str(ROOT / "data"))).resolve()
 ML_FEATURES = (
     "kmid", "klen", "ret1", "ret5", "ret10", "ret20", "ret60",
     "ma5_bias", "ma10_bias", "ma20_bias", "ma60_bias",
@@ -50,7 +52,9 @@ def _features(frame: pd.DataFrame, forward_horizon: int = 5) -> pd.DataFrame:
         raise ValueError("forward_horizon must be positive")
     future5 = pd.Series(float("nan"), index=frame.index)
     opens = frame["open"].to_numpy()
-    future5.iloc[:-(forward_horizon + 1)] = opens[forward_horizon + 1:] / opens[1:-forward_horizon] - 1
+    entry = pd.Series(opens[1:-forward_horizon]).where(lambda values: values > 0)
+    exit_ = pd.Series(opens[forward_horizon + 1:]).where(lambda values: values > 0)
+    future5.iloc[:-(forward_horizon + 1)] = (exit_ / entry - 1).to_numpy()
     output["future5"] = future5
     return output
 
@@ -156,7 +160,7 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         rebalance_days: int, market_ma: int, circuit_drawdown_pct: float,
         model_name: str = "linear", train_end: str = "2023-12-20",
         valid_end: str = "2024-12-20", require_stock_uptrend: bool = False,
-        forward_horizon: int = 5) -> dict:
+        forward_horizon: int = 5, data_start: str = "2022-01-01") -> dict:
     universe, universe_meta = load_universe()
     days = [pd.Timestamp(day) for day in sorted(universe) if start <= day <= end]
     if not universe_meta.get("complete") or len(days) < 120:
@@ -164,13 +168,13 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
     code_days = days
     if model_name == "lightgbm":
         # Freeze the research sample before test data begins.
-        code_days = [pd.Timestamp(day) for day in sorted(universe) if "2023-01-01" <= day <= valid_end]
+        code_days = [pd.Timestamp(day) for day in sorted(universe) if data_start <= day <= valid_end]
     codes = sorted(set().union(*(universe[str(day)[:10]] for day in code_days)))
     if max_stocks and len(codes) > max_stocks:
         codes = sorted(codes, key=lambda code: hashlib.sha256(code.encode("ascii")).digest())[:max_stocks]
-    history_start = "2022-01-01" if model_name == "lightgbm" else None
+    history_start = data_start if model_name == "lightgbm" else None
     bars = _load_bars(
-        ROOT / "data" / "stocks", codes, start, end,
+        DATA_ROOT / "stocks", codes, start, end,
         history_start=history_start, forward_horizon=forward_horizon,
     )
     if len(bars) < topk * 3:
@@ -180,7 +184,7 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         _fit_lightgbm(bars, train_end, valid_end, forward_horizon)
         if model_name == "lightgbm" else None
     )
-    index = pd.read_parquet(ROOT / "data" / "index" / "sh000001.parquet")
+    index = pd.read_parquet(DATA_ROOT / "index" / "sh000001.parquet")
     index["date"] = pd.to_datetime(index["date"])
     index = index.sort_values("date").set_index("date")
     index["market_ma"] = index["close"].rolling(market_ma).mean()
@@ -350,6 +354,7 @@ def main() -> int:
     parser.add_argument("--valid-end", default="2024-12-20")
     parser.add_argument("--require-stock-uptrend", action="store_true")
     parser.add_argument("--forward-horizon", type=int, default=5)
+    parser.add_argument("--data-start", default="2022-01-01")
     parser.add_argument("--output", type=Path, default=ROOT / "data" / "research_results" / "topk_dropout.json")
     args = parser.parse_args()
     result = run(
@@ -359,6 +364,7 @@ def main() -> int:
         train_end=args.train_end, valid_end=args.valid_end,
         require_stock_uptrend=args.require_stock_uptrend,
         forward_horizon=args.forward_horizon,
+        data_start=args.data_start,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

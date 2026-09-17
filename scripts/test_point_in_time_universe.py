@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from point_in_time_universe import load_history_manifest, load_universe, universe_from_listings
+from point_in_time_universe import (
+    build_universe_from_snapshot,
+    load_history_manifest,
+    load_universe,
+    universe_from_listings,
+)
 
 
 rebuilt = universe_from_listings([
@@ -53,6 +58,24 @@ with tempfile.TemporaryDirectory() as tmp:
     assert meta["complete"] and universe == rebuilt
     metadata.write_text(json.dumps({**meta, "complete": False}), encoding="utf-8")
     assert not load_universe(snapshot, metadata)[1]["complete"]
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    source = base / "source.json.gz"
+    snapshot = base / "universe.json.gz"
+    metadata = base / "metadata.json"
+    calendar = base / "index.parquet"
+    with gzip.open(source, "wt", encoding="utf-8") as fh:
+        json.dump({"listings": [
+            {"code": "sh.600001", "ipo_date": "2024-01-01", "out_date": ""},
+        ]}, fh)
+    pd.DataFrame({"date": pd.to_datetime(["2024-01-02", "2024-01-03"])}).to_parquet(calendar)
+    built = build_universe_from_snapshot(
+        "2024-01-01", "2024-01-04", source, calendar, snapshot, metadata,
+    )
+    assert built["complete"] and built["expected_trading_days"] == 2
+    universe, loaded = load_universe(snapshot, metadata)
+    assert loaded["complete"] and universe["2024-01-02"] == {"sh600001"}
 
 print("point_in_time_universe_ok")
 
