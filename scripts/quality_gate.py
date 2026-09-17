@@ -32,7 +32,9 @@ FAST = [
 FULL = FAST + [
     ["scripts/test_point_in_time_universe.py"],
     ["scripts/test_backfill_liquidity.py"],
+    ["scripts/test_backfill_fundamentals.py"],
     ["scripts/test_research_factor_ic.py"],
+    ["scripts/test_research_quality_value.py"],
     ["scripts/test_research_cloud_factor_overlay.py"],
     ["scripts/test_research_topk_dropout.py"],
     ["scripts/test_research_v61c_low_turnover.py"],
