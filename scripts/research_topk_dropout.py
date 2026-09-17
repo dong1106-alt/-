@@ -60,7 +60,8 @@ def _features(frame: pd.DataFrame, forward_horizon: int = 5) -> pd.DataFrame:
 
 
 def _load_bars(stock_dir: Path, codes: list[str], start: str, end: str,
-               history_start: str | None = None, forward_horizon: int = 5) -> dict[str, pd.DataFrame]:
+               history_start: str | None = None, forward_horizon: int = 5,
+               volume_multipliers: dict[str, int] | None = None) -> dict[str, pd.DataFrame]:
     bars = {}
     start_ts = pd.Timestamp(history_start) if history_start else pd.Timestamp(start) - pd.Timedelta(days=240)
     end_ts = pd.Timestamp(end)
@@ -80,8 +81,8 @@ def _load_bars(stock_dir: Path, codes: list[str], start: str, end: str,
             continue
         for column, values in _features(frame, forward_horizon).items():
             frame[column] = values
-        # Tencent/BaoStock daily volume is in board lots (100 shares).
-        frame["avg_value20"] = (frame["close"] * frame["volume"] * 100).rolling(20).mean()
+        multiplier = (volume_multipliers or {}).get(code, 100)
+        frame["avg_value20"] = (frame["close"] * frame["volume"] * multiplier).rolling(20).mean()
         bars[code] = frame.set_index("date")
         if number % 500 == 0:
             print(f"[topk] loaded {number}/{len(codes)} files")
@@ -156,6 +157,19 @@ def _tradable(row, previous_close: float, side: str) -> bool:
     return ratio < 1.095 if side == "buy" else ratio > 0.905
 
 
+def _rank_scores(cross: pd.DataFrame, model_name: str) -> pd.Series:
+    ranks = cross.rank(pct=True)
+    if model_name == "lightgbm":
+        return ranks["ml_score"]
+    if model_name == "reversal60":
+        return -ranks["ret60"]
+    weights = {
+        "ret5": 0.05, "ret20": 0.15, "ret60": 0.15, "ma20_bias": 0.10,
+        "vol20": 0.25, "rsv20": 0.05, "price_volume_corr20": 0.25,
+    }
+    return -sum(ranks[name] * weight for name, weight in weights.items())
+
+
 def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         rebalance_days: int, market_ma: int, circuit_drawdown_pct: float,
         model_name: str = "linear", train_end: str = "2023-12-20",
@@ -172,10 +186,18 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
     codes = sorted(set().union(*(universe[str(day)[:10]] for day in code_days)))
     if max_stocks and len(codes) > max_stocks:
         codes = sorted(codes, key=lambda code: hashlib.sha256(code.encode("ascii")).digest())[:max_stocks]
+    history_manifest = json.loads(
+        (DATA_ROOT / "universe" / "stock_history_manifest.json").read_text(encoding="utf-8")
+    ).get("stocks", {})
+    volume_multipliers = {
+        code: 1 if str(history_manifest.get(code, {}).get("source", "")).startswith("BaoStock") else 100
+        for code in codes
+    }
     history_start = data_start if model_name == "lightgbm" else None
     bars = _load_bars(
         DATA_ROOT / "stocks", codes, start, end,
         history_start=history_start, forward_horizon=forward_horizon,
+        volume_multipliers=volume_multipliers,
     )
     if len(bars) < topk * 3:
         raise RuntimeError("too few complete stock histories")
@@ -187,7 +209,8 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
     index = pd.read_parquet(DATA_ROOT / "index" / "sh000001.parquet")
     index["date"] = pd.to_datetime(index["date"])
     index = index.sort_values("date").set_index("date")
-    index["market_ma"] = index["close"].rolling(market_ma).mean()
+    if market_ma > 0:
+        index["market_ma"] = index["close"].rolling(market_ma).mean()
     days = [day for day in days if day in index.index]
     trade_cfg = load_trade_cost(ROOT / "config" / "settings.yaml")
 
@@ -268,7 +291,7 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         if day_number % rebalance_days or pending is not None:
             continue
 
-        market_on = float(index.loc[day, "close"]) > float(index.loc[day, "market_ma"])
+        market_on = market_ma <= 0 or float(index.loc[day, "close"]) > float(index.loc[day, "market_ma"])
         if not market_on or day_number < risk_off_until:
             if positions:
                 pending = ([], True)
@@ -279,9 +302,15 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
             if code not in membership:
                 continue
             row = _bar(frame, day)
-            factor_names = ("ml_score",) if model_name == "lightgbm" else (
-                "ret5", "ret20", "ret60", "ma20_bias", "vol20", "rsv20", "price_volume_corr20",
-            )
+            if model_name == "lightgbm":
+                factor_names = ("ml_score",)
+            elif model_name == "reversal60":
+                factor_names = ("ret60",)
+            else:
+                factor_names = (
+                    "ret5", "ret20", "ret60", "ma20_bias", "vol20", "rsv20",
+                    "price_volume_corr20",
+                )
             if row is None or any(pd.isna(row[name]) for name in factor_names):
                 continue
             if float(row["avg_value20"]) < 20_000_000:
@@ -292,16 +321,7 @@ def run(*, start: str, end: str, max_stocks: int, topk: int, n_drop: int,
         cross = pd.DataFrame(candidate_rows).set_index("code") if candidate_rows else pd.DataFrame()
         if cross.empty:
             continue
-        ranks = cross.rank(pct=True)
-        if model_name == "lightgbm":
-            scores = ranks["ml_score"]
-        else:
-            # Development-period IC selects reversal, low volatility, and negative price-volume correlation.
-            weights = {
-                "ret5": 0.05, "ret20": 0.15, "ret60": 0.15, "ma20_bias": 0.10,
-                "vol20": 0.25, "rsv20": 0.05, "price_volume_corr20": 0.25,
-            }
-            scores = -sum(ranks[name] * weight for name, weight in weights.items())
+        scores = _rank_scores(cross, model_name)
         order = list(scores.sort_values(ascending=False).index)
         rank = {code: number for number, code in enumerate(order)}
         forced = [code for code in positions if code not in membership or code not in rank]
@@ -349,7 +369,7 @@ def main() -> int:
     parser.add_argument("--rebalance-days", type=int, default=5)
     parser.add_argument("--market-ma", type=int, default=120)
     parser.add_argument("--circuit-drawdown-pct", type=float, default=8.0)
-    parser.add_argument("--model", choices=("linear", "lightgbm"), default="linear")
+    parser.add_argument("--model", choices=("linear", "lightgbm", "reversal60"), default="linear")
     parser.add_argument("--train-end", default="2023-12-20")
     parser.add_argument("--valid-end", default="2024-12-20")
     parser.add_argument("--require-stock-uptrend", action="store_true")
