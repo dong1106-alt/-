@@ -6,6 +6,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 _CONFIG = None
+DATA_ROOT_ENV = "SUPER_AGENT_DATA_ROOT"
 
 
 def _ensure_dir(p: Path):
@@ -36,6 +37,28 @@ def load_config():
 
     for k in list(paths.keys()):
         anchor(k)
+
+    data_root_value = os.environ.get(DATA_ROOT_ENV)
+    if data_root_value:
+        data_root = Path(data_root_value)
+        if not data_root.is_absolute():
+            data_root = ROOT / data_root
+        data_root = data_root.resolve()
+        paths.update({
+            "data_dir": str(data_root),
+            "stock_data_dir": str(data_root / "stocks"),
+            "raw_data_dir": str(data_root / "raw"),
+            "index_data_dir": str(data_root / "index"),
+            "cache_dir": str(data_root / "cache"),
+            "output_dir": str(data_root / "reports"),
+            "log_file": str(data_root / "logs" / "system.log"),
+            "state_file": str(data_root / "market_state_timeline.json"),
+            "params_file": str(data_root / "optimal_params.json"),
+            "params_history": str(data_root / "params_history.json"),
+            "deviation_log": str(data_root / "deviation_log.json"),
+            "signal_log": str(data_root / "signal_history.json"),
+            "opt_log_dir": str(data_root / "logs" / "opt"),
+        })
     # 确保关键目录存在
     for dk in ("data_dir", "stock_data_dir", "raw_data_dir", "index_data_dir",
                "cache_dir", "output_dir", "opt_log_dir"):

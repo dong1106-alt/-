@@ -18,8 +18,9 @@ import requests
 from point_in_time_universe import load_universe
 
 ROOT = Path(__file__).resolve().parent.parent
-STOCK_DIR = ROOT / "data" / "stocks"
-MANIFEST_PATH = ROOT / "data" / "universe" / "stock_history_manifest.json"
+DATA_ROOT = Path(os.environ.get("SUPER_AGENT_DATA_ROOT", str(ROOT / "data"))).resolve()
+STOCK_DIR = DATA_ROOT / "stocks"
+MANIFEST_PATH = DATA_ROOT / "universe" / "stock_history_manifest.json"
 API = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 FALLBACK_API = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
@@ -44,6 +45,31 @@ def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _save_frame(code: str, frame: pd.DataFrame, start: str, end: str,
+                source: str, queried_windows: list[list[str]]) -> dict:
+    frame = frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    for column in FIELDS[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["date", "open", "high", "low", "close"])
+    frame = frame[(frame["date"] >= start) & (frame["date"] <= end)]
+    frame = frame.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
+    if frame.empty:
+        return {"code": code, "status": "no_bars", "error": f"{source} returned no bars"}
+    if "trade_status" not in frame:
+        frame["trade_status"] = (frame["volume"].fillna(0) > 0).astype(int)
+    else:
+        frame["trade_status"] = pd.to_numeric(frame["trade_status"], errors="coerce").fillna(0).astype(int)
+    path = STOCK_DIR / f"{code}.parquet"
+    _atomic_parquet(frame, path)
+    return {
+        "code": code, "status": "complete", "source": source, "rows": len(frame),
+        "first_date": frame["date"].iloc[0].strftime("%Y-%m-%d"),
+        "last_date": frame["date"].iloc[-1].strftime("%Y-%m-%d"),
+        "queried_windows": queried_windows, "sha256": _sha256(path),
+    }
 
 
 def _windows(start: str, end: str):
@@ -94,28 +120,51 @@ def fetch_history(code: str, start: str, end: str, retries: int = 4) -> dict:
             return {"code": code, "status": "failed", "error": last_error}
     if not all_rows:
         return {"code": code, "status": "no_bars", "error": "empty response"}
-    frame = pd.DataFrame(all_rows, columns=FIELDS)
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    for column in FIELDS[1:]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=["date", "open", "high", "low", "close"])
-    frame = frame.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
-    frame["trade_status"] = (frame["volume"].fillna(0) > 0).astype(int)
-    path = STOCK_DIR / f"{code}.parquet"
-    _atomic_parquet(frame, path)
-    return {
-        "code": code, "status": "complete", "rows": len(frame),
-        "first_date": frame["date"].iloc[0].strftime("%Y-%m-%d"),
-        "last_date": frame["date"].iloc[-1].strftime("%Y-%m-%d"),
-        "queried_windows": queried, "sha256": _sha256(path),
-    }
+    return _save_frame(code, pd.DataFrame(all_rows, columns=FIELDS), start, end,
+                       "Tencent qfq", queried)
+
+
+def recover_with_baostock(codes: list[str], start: str, end: str):
+    """Sequential fallback for symbols Tencent no longer serves, especially delisted stocks."""
+    if not codes:
+        return
+    try:
+        import baostock as bs
+    except ImportError:
+        for code in codes:
+            yield {"code": code, "status": "failed", "error": "BaoStock is unavailable"}
+        return
+    login = bs.login()
+    if login.error_code != "0":
+        for code in codes:
+            yield {"code": code, "status": "failed", "error": f"BaoStock login: {login.error_msg}"}
+        return
+    try:
+        for code in codes:
+            dotted = f"{code[:2]}.{code[2:]}"
+            try:
+                result = bs.query_history_k_data_plus(
+                    dotted, "date,open,close,high,low,volume,tradestatus",
+                    start_date=start, end_date=end, frequency="d", adjustflag="2",
+                )
+                rows = []
+                while result.error_code == "0" and result.next():
+                    rows.append(result.get_row_data())
+                if result.error_code != "0":
+                    raise RuntimeError(result.error_msg)
+                frame = pd.DataFrame(rows, columns=[*FIELDS, "trade_status"])
+                yield _save_frame(code, frame, start, end, "BaoStock qfq", [[start, end]])
+            except Exception as exc:
+                yield {"code": code, "status": "failed", "error": f"BaoStock: {type(exc).__name__}: {exc}"}
+    finally:
+        bs.logout()
 
 
 def write_manifest(entries: dict[str, dict], start: str, end: str,
                    universe_sha256: str, path: Path = MANIFEST_PATH) -> dict:
     complete = sum(row.get("status") == "complete" for row in entries.values())
     payload = {
-        "schema": 1, "source": "Tencent daily kline", "adjustment": "forward",
+        "schema": 1, "source": "Tencent daily kline; BaoStock fallback", "adjustment": "forward",
         "start": start, "end": end, "universe_sha256": universe_sha256,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "expected_codes": len(entries), "complete_codes": complete,
@@ -129,13 +178,13 @@ def write_manifest(entries: dict[str, dict], start: str, end: str,
     return payload
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="2022-01-01")
     parser.add_argument("--end", required=True)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     universe, metadata = load_universe()
     if not metadata.get("complete"):
         raise SystemExit("point-in-time universe is incomplete")
@@ -168,6 +217,14 @@ def main() -> int:
             if index % 100 == 0 or index == len(pending):
                 manifest = write_manifest(entries, args.start, args.end, metadata["sha256"])
                 print(f"[history] {index}/{len(pending)} coverage={manifest['coverage']:.2%}", flush=True)
+    failed = [code for code, row in entries.items() if row.get("status") != "complete"]
+    if failed:
+        print(f"[history] Tencent unresolved={len(failed)}; trying BaoStock fallback", flush=True)
+        for index, row in enumerate(recover_with_baostock(failed, args.start, args.end), 1):
+            entries[row["code"]] = row
+            if index % 100 == 0 or index == len(failed):
+                manifest = write_manifest(entries, args.start, args.end, metadata["sha256"])
+                print(f"[history] fallback {index}/{len(failed)} coverage={manifest['coverage']:.2%}", flush=True)
     manifest = write_manifest(entries, args.start, args.end, metadata["sha256"])
     print(json.dumps({key: manifest[key] for key in (
         "expected_codes", "complete_codes", "coverage", "complete")

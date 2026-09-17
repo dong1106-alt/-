@@ -6,6 +6,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import socket
 from datetime import date, timedelta
 from pathlib import Path
@@ -13,10 +14,11 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SNAPSHOT = ROOT / "data" / "universe" / "point_in_time.json.gz"
-DEFAULT_METADATA = ROOT / "data" / "universe" / "metadata.json"
-DEFAULT_HISTORY_MANIFEST = ROOT / "data" / "universe" / "stock_history_manifest.json"
-DEFAULT_STOCK_DIR = ROOT / "data" / "stocks"
+DATA_ROOT = Path(os.environ.get("SUPER_AGENT_DATA_ROOT", str(ROOT / "data"))).resolve()
+DEFAULT_SNAPSHOT = DATA_ROOT / "universe" / "point_in_time.json.gz"
+DEFAULT_METADATA = DATA_ROOT / "universe" / "metadata.json"
+DEFAULT_HISTORY_MANIFEST = DATA_ROOT / "universe" / "stock_history_manifest.json"
+DEFAULT_STOCK_DIR = DATA_ROOT / "stocks"
 
 
 def _main_board(code: str) -> bool:
@@ -237,12 +239,12 @@ def update_index_history(start: str, end: str,
     return len(frame)
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--index-start")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     metadata = build_universe(args.start, args.end)
     if args.index_start:
         metadata["index_rows"] = update_index_history(args.index_start, args.end)

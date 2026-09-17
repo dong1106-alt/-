@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from candidate_engine import MIN_WALK_FORWARD_FOLDS, evaluate_backtest, write_json
 from causal_backtest import STRICT_EVALUATION_START, build_walk_forward_folds
 
-CANDIDATES = ROOT / "data" / "candidates"
+DATA_ROOT = Path(os.environ.get("SUPER_AGENT_DATA_ROOT", str(ROOT / "data"))).resolve()
+CANDIDATES = Path(os.environ.get("SUPER_AGENT_CANDIDATES_DIR", str(DATA_ROOT / "candidates"))).resolve()
+LEDGER_PATH = Path(os.environ.get(
+    "SUPER_AGENT_VALIDATION_LEDGER", str(ROOT / "data" / "candidates" / "validation_ledger.json")
+)).resolve()
 
 ALL_STATES = ("bull", "bear", "sideways", "transition")
 REQUIRED_STATES = ("bull", "bear", "sideways")  # 与 candidate_engine.REQUIRED_STATES 一致
@@ -56,12 +61,11 @@ def _validation_periods(output: dict) -> list[tuple[str, str]]:
                    for r in output.get("results", []) for f in r.get("fold_metrics", [])})
 
 
-def _consumed_periods() -> list[tuple[str, str]] | None:
-    ledger_path = CANDIDATES / "validation_ledger.json"
-    if not ledger_path.exists():
+def _consumed_periods(exclude_reservation: str | None = None) -> list[tuple[str, str]] | None:
+    if not LEDGER_PATH.exists():
         return []
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     periods = []
@@ -80,7 +84,42 @@ def _consumed_periods() -> list[tuple[str, str]] | None:
             else:
                 return None
         periods.extend(tuple(period) for period in historical)
+    for reservation_id, reservation in ledger.get("reservations", {}).items():
+        if reservation_id != exclude_reservation:
+            periods.extend(tuple(period) for period in reservation.get("validation_periods", []))
     return periods
+
+
+def reserve_validation_periods(reservation_id: str, periods: list[tuple[str, str]],
+                               profile_sha256: str) -> dict:
+    """Consume planned OOS dates before strategy results are calculated."""
+    if not reservation_id or not periods:
+        raise ValueError("reservation id and validation periods are required")
+    try:
+        ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        ledger = {"entries": {}, "reservations": {}}
+    ledger.setdefault("entries", {})
+    reservations = ledger.setdefault("reservations", {})
+    existing = reservations.get(reservation_id)
+    normalized = [list(period) for period in periods]
+    if existing:
+        if (existing.get("validation_periods") != normalized
+                or existing.get("profile_sha256") != profile_sha256):
+            raise RuntimeError("validation reservation changed after creation")
+        return existing
+    consumed = _consumed_periods()
+    if consumed is None or _overlaps_consumed(periods, consumed):
+        raise RuntimeError("validation periods overlap consumed or reserved dates")
+    reservation = {
+        "validation_periods": normalized,
+        "profile_sha256": profile_sha256,
+        "status": "reserved",
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    reservations[reservation_id] = reservation
+    write_json(LEDGER_PATH, ledger)
+    return reservation
 
 
 def _overlaps_consumed(periods: list[tuple[str, str]], consumed: list[tuple[str, str]]) -> bool:
@@ -107,6 +146,7 @@ def _candidate_identity(output: dict) -> tuple[str, str]:
         "data": output.get("data_snapshot_hash"),
         "universe": (output.get("point_in_time_universe") or {}).get("sha256"),
         "history": (output.get("point_in_time_universe") or {}).get("stock_history_manifest_sha256"),
+        "validation_profile": output.get("validation_profile"),
     })
     periods = _validation_periods(output)
     # Keep the v2 ledger namespace: changing scoring rules must not unlock old periods.
@@ -114,11 +154,10 @@ def _candidate_identity(output: dict) -> tuple[str, str]:
     return signature, validation_key
 
 
-def _ledger_decision(output: dict) -> tuple[dict, bool]:
+def _ledger_decision(output: dict, reservation_id: str | None = None) -> tuple[dict, bool]:
     signature, validation_key = _candidate_identity(output)
-    ledger_path = CANDIDATES / "validation_ledger.json"
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         ledger = {"entries": {}}
     previous = ledger["entries"].get(validation_key)
@@ -131,8 +170,17 @@ def _ledger_decision(output: dict) -> tuple[dict, bool]:
             "candidate_signature": signature,
             "validation_key": validation_key,
         }, True
-    consumed = _consumed_periods()
-    if consumed is None or _overlaps_consumed(_validation_periods(output), consumed):
+    reservation = ledger.get("reservations", {}).get(reservation_id) if reservation_id else None
+    periods = _validation_periods(output)
+    if reservation and reservation.get("validation_periods") != [list(period) for period in periods]:
+        return {
+            "decision": "rejected",
+            "reason": "实际滚动验证区间与运行前预约不一致",
+            "candidate_signature": signature,
+            "validation_key": validation_key,
+        }, True
+    consumed = _consumed_periods(exclude_reservation=reservation_id)
+    if consumed is None or _overlaps_consumed(periods, consumed):
         return {
             "decision": "rejected",
             "reason": ("验证账本缺少历史区间，禁止继续" if consumed is None
@@ -145,17 +193,20 @@ def _ledger_decision(output: dict) -> tuple[dict, bool]:
     ledger["entries"][validation_key] = {
         "candidate_signature": signature,
         "evaluation": evaluation,
-        "validation_periods": _validation_periods(output),
+        "validation_periods": periods,
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
-    write_json(ledger_path, ledger)
+    if reservation:
+        reservation.update({"status": "consumed", "validation_key": validation_key})
+    write_json(LEDGER_PATH, ledger)
     return evaluation, False
 
 
 def main(argv: list[str]) -> int:
     today = dt.date.today()
-    monthly = "--monthly" in argv
-    if not _is_trading_day(today):
+    historical = "--historical" in argv
+    monthly = "--monthly" in argv or historical
+    if not historical and not _is_trading_day(today):
         # 每日候选顺延无意义（轮换本就跨天累积），照旧静默跳过；
         # 月度每月只跑一次，静默跳过会丢掉整月重优化，故返回顺延码让调度器次日重试。
         if monthly:
@@ -164,13 +215,15 @@ def main(argv: list[str]) -> int:
         print("[candidate] 非交易日，跳过")
         return 0
 
-    candidate_id = f"candidate-{today:%Y%m%d}" + ("-monthly" if monthly else "")
+    candidate_id = os.environ.get(
+        "SUPER_AGENT_CANDIDATE_ID", f"candidate-{today:%Y%m%d}" + ("-monthly" if monthly else "")
+    )
     raw_path = CANDIDATES / "raw" / f"{candidate_id}.json"
     eval_path = CANDIDATES / "evaluations" / f"{candidate_id}.json"
     n_trials, n_stocks = (50, 50) if monthly else (10, 20)
     validation_after = None
 
-    if monthly:
+    if monthly and not historical:
         consumed = _consumed_periods()
         reason = None
         if consumed is None:
@@ -242,6 +295,15 @@ def main(argv: list[str]) -> int:
         print(evaluation["reason"])
         return 1
 
+    profile_sha256 = os.environ.get("SUPER_AGENT_VALIDATION_PROFILE_SHA256")
+    if profile_sha256:
+        output["validation_profile"] = {
+            "id": os.environ.get("SUPER_AGENT_VALIDATION_PROFILE_ID", ""),
+            "sha256": profile_sha256,
+            "evaluation_start": STRICT_EVALUATION_START,
+        }
+        write_json(raw_path, output)
+
     if not monthly:
         evaluation = {
             "candidate_id": candidate_id, "decision": "research_only",
@@ -253,7 +315,9 @@ def main(argv: list[str]) -> int:
         print(f"[candidate] {evaluation['reason']}")
         return 0
 
-    evaluation, reused = _ledger_decision(output)
+    evaluation, reused = _ledger_decision(
+        output, reservation_id=os.environ.get("SUPER_AGENT_VALIDATION_RESERVATION")
+    )
     evaluation.update({"candidate_id": candidate_id, "created_at": dt.datetime.now().isoformat(timespec="seconds"), "raw_path": str(raw_path)})
     write_json(eval_path, evaluation)
 

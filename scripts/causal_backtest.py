@@ -2,12 +2,13 @@
 """Shared causal execution and walk-forward rules for strategy evaluation."""
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from typing import Iterable, Sequence
 
 from scripts.trading_rules import calc_trade_cost
 
-STRICT_EVALUATION_START = "2023-01-01"
+STRICT_EVALUATION_START = os.environ.get("SUPER_AGENT_EVALUATION_START", "2023-01-01")
 
 
 @dataclass(frozen=True)

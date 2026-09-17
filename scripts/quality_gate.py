@@ -20,6 +20,8 @@ FAST = [
     ["scripts/test_causal_quality.py"],
     ["scripts/test_candidate_engine.py"],
     ["scripts/test_candidate_optimizer_safety.py"],
+    ["scripts/test_historical_validation.py"],
+    ["scripts/test_shadow_package.py"],
     ["scripts/test_company_invest_gate.py"],
     ["scripts/test_canonical_wrappers.py"],
 ]
