@@ -146,8 +146,8 @@ def main(argv=None) -> int:
         failures.append("封存集夏普未提升10%")
     if candidate_metrics["return"] < baseline_metrics["return"]:
         failures.append("封存集收益低于基准")
-    if abs(candidate_metrics["drawdown"]) > MAX_DRAWDOWN_PCT:
-        failures.append("封存集回撤超过10%")
+    if abs(candidate_metrics["drawdown"]) >= MAX_DRAWDOWN_PCT:
+        failures.append(f"封存集回撤未低于{MAX_DRAWDOWN_PCT:.0f}%")
     if abs(candidate_metrics["drawdown"]) > abs(baseline_metrics["drawdown"]):
         failures.append("封存集回撤劣于基准")
     result = {

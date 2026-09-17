@@ -31,6 +31,7 @@ FAST = [
 
 FULL = FAST + [
     ["scripts/test_point_in_time_universe.py"],
+    ["scripts/test_backfill_liquidity.py"],
     ["scripts/test_shadow_pairing.py"],
     ["scripts/test_sim_risk_smoke.py"],
     ["scripts/regression_test.py"],

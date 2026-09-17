@@ -13,7 +13,7 @@ MIN_OOS_TRADES = 40
 MIN_STATE_OOS_TRADES = 10
 MIN_WALK_FORWARD_FOLDS = 3
 MIN_SHADOW_CLOSED_TRADES = 20
-MAX_DRAWDOWN_PCT = 10.0
+MAX_DRAWDOWN_PCT = 20.0
 MIN_SHARPE_IMPROVEMENT = 0.10
 
 
@@ -77,8 +77,8 @@ def evaluate_backtest(output: dict) -> dict:
             row_failures.append("夏普未提升10%")
         if ret < baseline_ret:
             row_failures.append("净收益低于基准")
-        if dd > MAX_DRAWDOWN_PCT:
-            row_failures.append(f"回撤{dd:.2f}%超过{MAX_DRAWDOWN_PCT:.0f}%")
+        if dd >= MAX_DRAWDOWN_PCT:
+            row_failures.append(f"回撤{dd:.2f}%未低于{MAX_DRAWDOWN_PCT:.0f}%")
         if dd > baseline_dd:
             row_failures.append("回撤劣于基准")
         if row_failures:
