@@ -201,6 +201,31 @@ def build_universe(start: str, end: str, snapshot_path=DEFAULT_SNAPSHOT,
     return _save_snapshot(snapshot_path, metadata_path, payload, expected, valid)
 
 
+def build_universe_from_snapshot(start: str, end: str, source_snapshot: Path,
+                                 calendar_path: Path, snapshot_path=DEFAULT_SNAPSHOT,
+                                 metadata_path=DEFAULT_METADATA) -> dict:
+    """Build an older universe from a frozen security master and index calendar."""
+    with gzip.open(source_snapshot, "rt", encoding="utf-8") as fh:
+        source = json.load(fh)
+    listings = source.get("listings") or []
+    calendar = pd.read_parquet(calendar_path, columns=["date"])
+    days = sorted({str(day)[:10] for day in pd.to_datetime(calendar["date"])
+                   if start <= str(day)[:10] <= end})
+    near_start = days and (pd.Timestamp(days[0]) - pd.Timestamp(start)).days <= 7
+    near_end = days and (pd.Timestamp(end) - pd.Timestamp(days[-1])).days <= 7
+    if not listings or not near_start or not near_end:
+        raise RuntimeError("frozen listings or index calendar do not cover requested range")
+    payload = {
+        "source": "frozen security master + index trading calendar",
+        "start": start,
+        "end": end,
+        "trading_days": days,
+        "listings": listings,
+    }
+    valid = all(universe_from_listings(listings, days).values())
+    return _save_snapshot(Path(snapshot_path), Path(metadata_path), payload, days, valid)
+
+
 def update_index_history(start: str, end: str,
                          path=ROOT / "data" / "index" / "sh000001.parquet") -> int:
     try:
@@ -244,9 +269,18 @@ def main(argv=None) -> int:
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--index-start")
+    parser.add_argument("--seed-snapshot", type=Path)
+    parser.add_argument("--calendar-parquet", type=Path)
     args = parser.parse_args(argv)
-    metadata = build_universe(args.start, args.end)
-    if args.index_start:
+    if bool(args.seed_snapshot) != bool(args.calendar_parquet):
+        parser.error("--seed-snapshot and --calendar-parquet must be used together")
+    if args.seed_snapshot:
+        metadata = build_universe_from_snapshot(
+            args.start, args.end, args.seed_snapshot, args.calendar_parquet,
+        )
+    else:
+        metadata = build_universe(args.start, args.end)
+    if args.index_start and not args.seed_snapshot:
         metadata["index_rows"] = update_index_history(args.index_start, args.end)
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
     return 0 if metadata["complete"] else 1

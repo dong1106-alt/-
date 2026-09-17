@@ -10,6 +10,7 @@ from pathlib import Path
 
 from candidate_engine import MAX_DRAWDOWN_PCT, write_json
 from candidate_optimize import _candidate_identity
+from performance_metrics import excellent_failures
 from point_in_time_universe import load_history_manifest, load_universe
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +57,13 @@ def main(argv=None) -> int:
             or recommendation.get("candidate_signature") != signature
             or not recommendation.get("paired_baseline", {}).get("passed")):
         raise SystemExit("candidate did not pass paired shadow gate")
+    oos_failures = excellent_failures(evaluation.get("excellent_metrics") or {}, require_deviation=False)
+    shadow_failures = excellent_failures(
+        recommendation.get("paired_baseline", {}).get("excellent_metrics") or {},
+        require_deviation=True,
+    )
+    if oos_failures or shadow_failures:
+        raise SystemExit("candidate did not pass excellent performance gate")
     universe, universe_meta = load_universe()
     if not universe_meta.get("complete"):
         raise SystemExit("point-in-time universe is incomplete")

@@ -34,6 +34,11 @@ class FakeCore:
             "validation_protocol": "wf-v3",
             "point_in_time_universe": {"complete": True},
             "data_snapshot_hash": "fixture",
+            "excellent_metrics": {
+                "annual_return_pct": 26, "max_drawdown_pct": 9,
+                "calmar": 2.1, "sortino": 2.6, "sharpe": 2.1,
+                "closed_trades": 501,
+            },
             "results": [row("bull"), row("bear"), row("sideways")],
         }
         path = Path(output_path)

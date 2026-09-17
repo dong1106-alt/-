@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from performance_metrics import EXCELLENT_THRESHOLDS, excellent_failures
+
 REQUIRED_STATES = ("bull", "bear", "sideways")
 MIN_OOS_TRADES = 40
 MIN_STATE_OOS_TRADES = 10
@@ -27,6 +29,10 @@ def evaluate_backtest(output: dict) -> dict:
     by_state = {r.get("state"): r for r in output.get("results", [])}
     missing = [s for s in REQUIRED_STATES if s not in by_state]
     failures: list[str] = []
+    excellent_metrics = output.get("excellent_metrics") or {}
+    excellent_gate_failures = excellent_failures(excellent_metrics, require_deviation=False)
+    if excellent_gate_failures:
+        failures.append("优秀门槛：" + "、".join(excellent_gate_failures))
     if output.get("validation_protocol") != "wf-v3":
         failures.append("验证协议不是wf-v3")
     universe = output.get("point_in_time_universe") or {}
@@ -92,6 +98,7 @@ def evaluate_backtest(output: dict) -> dict:
         "required_states": list(REQUIRED_STATES),
         "oos_closed_trades": total_trades,
         "state_metrics": state_metrics,
+        "excellent_metrics": excellent_metrics,
         "thresholds": {
             "min_oos_closed_trades": MIN_OOS_TRADES,
             "min_state_oos_closed_trades": MIN_STATE_OOS_TRADES,
@@ -99,6 +106,7 @@ def evaluate_backtest(output: dict) -> dict:
             "min_shadow_closed_trades": MIN_SHADOW_CLOSED_TRADES,
             "min_sharpe_improvement": MIN_SHARPE_IMPROVEMENT,
             "max_drawdown_pct": MAX_DRAWDOWN_PCT,
+            "excellent": EXCELLENT_THRESHOLDS,
         },
     }
 
