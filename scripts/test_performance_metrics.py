@@ -13,10 +13,12 @@ assert backtest_deviation_pct(27, 25) == 8
 
 passing = {
     "annual_return_pct": 25.01, "max_drawdown_pct": 19.99,
-    "calmar": 2.01, "sortino": 2.51, "sharpe": 2.01,
+    "calmar": 1.51, "sortino": 1.51, "sharpe": 1.51,
     "closed_trades": 501, "backtest_deviation_pct": 9.99,
 }
 assert excellent_failures(passing, require_deviation=True) == []
+for ratio in ("calmar", "sortino", "sharpe"):
+    assert len(excellent_failures({**passing, ratio: 1.5}, require_deviation=True)) == 1
 assert len(excellent_failures({**passing, "max_drawdown_pct": 20}, require_deviation=True)) == 1
 assert len(excellent_failures({**passing, "closed_trades": 500}, require_deviation=True)) == 1
 assert len(excellent_failures({**passing, "backtest_deviation_pct": 10}, require_deviation=True)) == 1
