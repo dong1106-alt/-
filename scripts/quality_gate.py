@@ -36,6 +36,7 @@ FULL = FAST + [
     ["scripts/test_backfill_industries.py"],
     ["scripts/test_research_factor_ic.py"],
     ["scripts/test_research_quality_value.py"],
+    ["scripts/test_research_linear_multifactor.py"],
     ["scripts/test_research_four_industry_breadth.py"],
     ["scripts/test_research_v27_price_volume.py"],
     ["scripts/test_research_cloud_factor_overlay.py"],
