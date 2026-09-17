@@ -21,9 +21,17 @@ def row(state, trades=20, sharpe=1.2, baseline=1.0, ret=5.0, base_ret=4.0, dd=-5
 good = {
     "validation_protocol": "wf-v3",
     "point_in_time_universe": {"complete": True},
+    "excellent_metrics": {
+        "annual_return_pct": 26, "max_drawdown_pct": 9,
+        "calmar": 2.1, "sortino": 2.6, "sharpe": 2.1,
+        "closed_trades": 501,
+    },
     "results": [row("bull"), row("bear"), row("sideways")],
 }
 assert evaluate_backtest(good)["decision"] == "shadow_ready"
+
+missing_excellent_metrics = {key: value for key, value in good.items() if key != "excellent_metrics"}
+assert evaluate_backtest(missing_excellent_metrics)["decision"] == "rejected"
 
 few_trades = {**good, "results": [row("bull", 13), row("bear", 13), row("sideways", 13)]}
 assert evaluate_backtest(few_trades)["decision"] == "rejected"

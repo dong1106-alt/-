@@ -58,6 +58,11 @@ def _prepare(candidate_id):
         meta.write_text(json.dumps({
             "created_at": dt.datetime.now().isoformat(timespec="seconds"),
             "baseline_trade_count": len(portfolio.get("trade_history", [])),
+            "baseline_equity_count": len(portfolio.get("equity_history", [])),
+            "baseline_equity_last_date": (
+                portfolio.get("equity_history", [])[-1].get("date")
+                if portfolio.get("equity_history") else None
+            ),
             "baseline_position_count": len(portfolio.get("positions", [])),
             "candidate_id": candidate_id,
             "baseline_main_total_value": portfolio.get("total_value", 0),

@@ -10,6 +10,7 @@ import statistics
 from pathlib import Path
 
 from candidate_engine import MAX_DRAWDOWN_PCT, MIN_SHADOW_CLOSED_TRADES, write_json
+from performance_metrics import backtest_deviation_pct, calculate, excellent_failures
 
 ROOT = Path(__file__).resolve().parent.parent
 SHADOW = Path(os.environ.get("SHADOW_ROOT", str(ROOT / "data" / "shadow")))
@@ -37,23 +38,45 @@ def _sharpe_pass(candidate: float, baseline: float) -> bool:
 
 def compare_pair(candidate: dict, baseline: dict, candidate_start_count: int,
                  baseline_start_count: int, candidate_start_value: float,
-                 baseline_start_value: float) -> dict:
-    candidate_dates = [row.get("date") for row in candidate.get("equity_history", [])]
-    baseline_dates = [row.get("date") for row in baseline.get("equity_history", [])]
+                 baseline_start_value: float, expected_annual_return_pct=None,
+                 candidate_start_equity_count: int = 0,
+                 baseline_start_equity_count: int = 0,
+                 candidate_start_equity_date: str | None = None,
+                 baseline_start_equity_date: str | None = None) -> dict:
+    def after_start(portfolio, count, day):
+        history = portfolio.get("equity_history", [])
+        if day:
+            return [row for row in history if str(row.get("date", ""))[:10] > str(day)[:10]]
+        return history[count:]
+
+    candidate_history = after_start(candidate, candidate_start_equity_count, candidate_start_equity_date)
+    baseline_history = after_start(baseline, baseline_start_equity_count, baseline_start_equity_date)
+    candidate_dates = [row.get("date") for row in candidate_history]
+    baseline_dates = [row.get("date") for row in baseline_history]
     candidate_closed = closed_trades(candidate, candidate_start_count)
     baseline_closed = closed_trades(baseline, baseline_start_count)
     candidate_delta = float(candidate.get("total_value", 0)) - candidate_start_value
     baseline_delta = float(baseline.get("total_value", 0)) - baseline_start_value
-    candidate_dd = abs(float(candidate.get("max_drawdown", 0) or 0))
-    baseline_dd = abs(float(baseline.get("max_drawdown", 0) or 0))
-    candidate_sharpe = equity_sharpe(candidate)
-    baseline_sharpe = equity_sharpe(baseline)
+    candidate_curve = [{"date": "0000-00-00", "total_value": candidate_start_value}, *candidate_history]
+    baseline_curve = [{"date": "0000-00-00", "total_value": baseline_start_value}, *baseline_history]
+    excellent_metrics = calculate(
+        candidate_curve, candidate_closed,
+    )
+    baseline_metrics = calculate(baseline_curve, baseline_closed)
+    candidate_dd = excellent_metrics["max_drawdown_pct"]
+    baseline_dd = baseline_metrics["max_drawdown_pct"]
+    candidate_sharpe = excellent_metrics["sharpe"]
+    baseline_sharpe = baseline_metrics["sharpe"]
+    if expected_annual_return_pct is not None:
+        excellent_metrics["backtest_deviation_pct"] = backtest_deviation_pct(
+            excellent_metrics["annual_return_pct"], expected_annual_return_pct,
+        )
     failures = []
     if candidate_dates != baseline_dates or len(candidate_dates) != len(set(candidate_dates)):
         failures.append("候选与基准权益日期不一致")
     if candidate_closed < MIN_SHADOW_CLOSED_TRADES:
         failures.append(f"候选平仓{candidate_closed}笔，少于{MIN_SHADOW_CLOSED_TRADES}笔")
-    if len(candidate.get("equity_history", [])) < 21:
+    if len(candidate_history) < 21:
         failures.append("候选权益历史少于21个交易日")
     if candidate_delta < baseline_delta:
         failures.append("候选收益低于配对基准")
@@ -63,6 +86,7 @@ def compare_pair(candidate: dict, baseline: dict, candidate_start_count: int,
         failures.append(f"候选回撤{candidate_dd:.2f}%超过{MAX_DRAWDOWN_PCT:.0f}%")
     if candidate_dd > baseline_dd:
         failures.append("候选回撤劣于配对基准")
+    failures.extend(excellent_failures(excellent_metrics, require_deviation=True))
     return {
         "passed": not failures,
         "failures": failures,
@@ -74,6 +98,7 @@ def compare_pair(candidate: dict, baseline: dict, candidate_start_count: int,
         "baseline_sharpe": round(baseline_sharpe, 3),
         "candidate_drawdown": candidate_dd,
         "baseline_drawdown": baseline_dd,
+        "excellent_metrics": excellent_metrics,
     }
 
 
@@ -91,6 +116,12 @@ def main() -> int:
     candidate = _read(portfolio_path)
     meta = _read(meta_path)
     candidate_id = meta.get("candidate_id", "v6-risk-baseline")
+    active_path = ROOT / "data" / "candidates" / "active_shadow.json"
+    active = _read(active_path) if active_path.exists() else {}
+    expected_annual_return = (
+        active.get("candidate_meta", {}).get("evaluation", {})
+        .get("excellent_metrics", {}).get("annual_return_pct")
+    )
 
     pair = None
     if candidate_id != "v6-risk-baseline" and PAIRED:
@@ -110,6 +141,11 @@ def main() -> int:
                     int(baseline_meta.get("baseline_trade_count", 0)),
                     float(meta.get("baseline_main_total_value", 0)),
                     float(baseline_meta.get("baseline_main_total_value", 0)),
+                    expected_annual_return,
+                    int(meta.get("baseline_equity_count", 0)),
+                    int(baseline_meta.get("baseline_equity_count", 0)),
+                    meta.get("baseline_equity_last_date"),
+                    baseline_meta.get("baseline_equity_last_date"),
                 )
 
     if candidate_id == "v6-risk-baseline":
