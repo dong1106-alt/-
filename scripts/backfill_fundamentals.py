@@ -88,7 +88,7 @@ def _normalize_performance(rows: list[dict], allowed: set[str]) -> pd.DataFrame:
             # Current API rows contain the latest revision, so original notice alone is unsafe.
             "performance_available_date": max(notice, update),
             "eps": _number(row.get("BASIC_EPS")),
-            "net_profit": _number(row.get("PARENTNETPROFIT")),
+            "net_profit": _number(row.get("PARENT_NETPROFIT")),
             "roe": _number(row.get("WEIGHTAVG_ROE")) / 100.0,
             "profit_yoy": _number(row.get("SJLTZ")) / 100.0,
             "bps": _number(row.get("BPS")),
