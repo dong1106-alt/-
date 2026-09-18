@@ -9,6 +9,16 @@ STAGE="$(mktemp -d "$BASE/.stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
 unzip -q "$ARCHIVE" -d "$STAGE"
+MAIN="$STAGE/龟缠量化v6_optimized.py"
+if [ ! -f "$MAIN" ]; then
+  # Some Ubuntu unzip builds ignore UTF-8 path metadata and mangle this legacy filename.
+  MANGLED_MAIN="$(find "$STAGE" -maxdepth 1 -type f -name '*v6_optimized.py' -print -quit)"
+  [ -n "$MANGLED_MAIN" ] && mv -- "$MANGLED_MAIN" "$MAIN"
+fi
+test -f "$MAIN" || { echo "release missing main strategy source" >&2; exit 1; }
+test -f "$STAGE/data/causal_quality.py" || { echo "release missing data/causal_quality.py" >&2; exit 1; }
+test -f "$STAGE/data/company_quality.py" || { echo "release missing data/company_quality.py" >&2; exit 1; }
+test -f "$STAGE/data/valuation.py" || { echo "release missing data/valuation.py" >&2; exit 1; }
 python3 - <<PY
 import json
 from pathlib import Path
