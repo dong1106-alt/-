@@ -42,6 +42,7 @@ FULL = FAST + [
     ["scripts/test_research_trend_risk_v5.py"],
     ["scripts/test_research_industry_reversal.py"],
     ["scripts/test_research_smallcap_risk_control.py"],
+    ["scripts/test_research_smallcap_70_audit.py"],
     ["scripts/test_research_value_low_volatility.py"],
     ["scripts/test_research_uptrend_r2.py"],
     ["scripts/test_research_contrarian_momentum.py"],
