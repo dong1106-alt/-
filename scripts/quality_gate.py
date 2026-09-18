@@ -43,6 +43,7 @@ FULL = FAST + [
     ["scripts/test_research_industry_reversal.py"],
     ["scripts/test_research_smallcap_risk_control.py"],
     ["scripts/test_research_value_low_volatility.py"],
+    ["scripts/test_research_uptrend_r2.py"],
     ["scripts/test_research_four_industry_breadth.py"],
     ["scripts/test_research_v27_price_volume.py"],
     ["scripts/test_research_cloud_factor_overlay.py"],
