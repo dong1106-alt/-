@@ -19,7 +19,7 @@ OUT = ROOT / "release"
 EXCLUDE_DIRS = {".git", ".venv", "__pycache__", "logs", "reports", "data", "release", "dist", ".pytest_cache"}
 EXCLUDE_NAMES = {"secrets.yaml", ".env"}
 EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".zip", ".tar.gz"}
-INCLUDE_TOP = {"api_service", "codeact", "config", "scripts"}
+INCLUDE_TOP = {"api_service", "codeact", "config", "scripts", "data"}
 INCLUDE_FILES = {
     "scheduler.py", "daily_pipeline.py", "codeact_sdk.py", "requirements.txt",
     "super-agent-api.service", "super-agent-scheduler.service", "Caddyfile.example",
@@ -30,7 +30,9 @@ INCLUDE_FILES = {
 
 def ignored(path: Path) -> bool:
     rel = path.relative_to(ROOT)
-    if any(part in EXCLUDE_DIRS for part in rel.parts):
+    # Runtime data stays out of releases; shared Python helpers under data/ do not.
+    data_source = rel.parts[0] == "data" and path.suffix == ".py"
+    if any(part in EXCLUDE_DIRS for part in rel.parts) and not data_source:
         return True
     if path.name in EXCLUDE_NAMES or path.name == "secrets.yaml":
         return True
