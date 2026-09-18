@@ -19,6 +19,11 @@ test -f "$MAIN" || { echo "release missing main strategy source" >&2; exit 1; }
 test -f "$STAGE/data/causal_quality.py" || { echo "release missing data/causal_quality.py" >&2; exit 1; }
 test -f "$STAGE/data/company_quality.py" || { echo "release missing data/company_quality.py" >&2; exit 1; }
 test -f "$STAGE/data/valuation.py" || { echo "release missing data/valuation.py" >&2; exit 1; }
+sudo mkdir -p "$BASE/data"
+for source in "$STAGE"/data/*.py; do
+  sudo install -o superagent -g superagent -m 644 "$source" "$BASE/data/$(basename "$source")"
+done
+rm -rf "$STAGE/data"
 python3 - <<PY
 import json
 from pathlib import Path
